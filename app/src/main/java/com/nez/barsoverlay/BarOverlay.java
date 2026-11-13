@@ -83,8 +83,12 @@ public final class BarOverlay {
         return f;
     }
 
-    /** Tempelkan bar ke leash jendela aplikasi (ukuran w x h = ukuran layar). */
-    public static void attach(Context c, SurfaceControl leash, int w, int h) {
+    private static volatile SurfaceControl warmSc;
+
+    public static boolean isWarm() { return warmSc != null; }
+
+    /** Siapkan host + gambar bar lebih dulu supaya frame pertama animasi sudah ada bar-nya. */
+    public static void prewarm(Context c, int w, int h) {
         release();
         try {
             DisplayManager dm = (DisplayManager) c.getSystemService(Context.DISPLAY_SERVICE);
@@ -92,7 +96,37 @@ public final class BarOverlay {
             host = new SurfaceControlViewHost(c, disp, new Binder());
             host.setView(build(c), w, h);
             pkg = host.getSurfacePackage();
-            SurfaceControl sc = pkg.getSurfaceControl();
+            warmSc = pkg.getSurfaceControl();
+        } catch (Throwable t) {
+            XposedBridge.log(t);
+            release();
+        }
+    }
+
+    /**
+     * Tempel bar siap-pakai ke leash lewat transaksi awal animasi (tx), jadi muncul
+     * bersamaan dengan frame pertama. Boleh dipanggil dari thread mana pun.
+     */
+    public static boolean attachTo(SurfaceControl.Transaction tx, SurfaceControl leash) {
+        try {
+            SurfaceControl sc = warmSc;
+            if (sc == null || !sc.isValid()) return false;
+            tx.reparent(sc, leash)
+                    .setLayer(sc, Integer.MAX_VALUE)
+                    .setVisibility(sc, true);
+            return true;
+        } catch (Throwable t) {
+            XposedBridge.log(t);
+            return false;
+        }
+    }
+
+    /** Cadangan kalau belum ada yang siap: buat sekarang lalu tempel (agak telat). */
+    public static void attach(Context c, SurfaceControl leash, int w, int h) {
+        prewarm(c, w, h);
+        try {
+            SurfaceControl sc = warmSc;
+            if (sc == null) return;
             new SurfaceControl.Transaction()
                     .reparent(sc, leash)
                     .setLayer(sc, Integer.MAX_VALUE)
@@ -105,6 +139,7 @@ public final class BarOverlay {
     }
 
     public static void release() {
+        warmSc = null;
         try {
             if (pkg != null) pkg.release();
         } catch (Throwable ignored) {

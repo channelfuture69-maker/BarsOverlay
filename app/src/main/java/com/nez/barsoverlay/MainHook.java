@@ -31,9 +31,26 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     private static final Set<Class<?>> DONE = Collections.synchronizedSet(new HashSet<Class<?>>());
+    /** Lepas bar yang tadi dipakai, lalu siapkan yang baru untuk animasi berikutnya. */
     private static final Runnable HIDE = new Runnable() {
-        @Override public void run() { BarOverlay.release(); }
+        @Override public void run() {
+            BarOverlay.release();
+            warm();
+        }
     };
+
+    private static final Runnable WARM = new Runnable() {
+        @Override public void run() {
+            if (!BarOverlay.isWarm()) warm();
+        }
+    };
+
+    private static void warm() {
+        Context ctx = app();
+        if (ctx == null) return;
+        DisplayMetrics dm = ctx.getResources().getDisplayMetrics();
+        BarOverlay.prewarm(ctx, dm.widthPixels, dm.heightPixels);
+    }
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpp) {
@@ -49,6 +66,8 @@ public class MainHook implements IXposedHookLoadPackage {
                     for (Object a : p.args) {
                         if (a != null && irt.isInstance(a)) hookRunner(a.getClass(), fcb);
                     }
+                    h().removeCallbacks(WARM);
+                    h().postDelayed(WARM, 500);
                 }
             });
             XposedBridge.log("BarsOverlay: aktif di " + lpp.packageName);
@@ -63,23 +82,30 @@ public class MainHook implements IXposedHookLoadPackage {
             @Override
             protected void beforeHookedMethod(MethodHookParam p) {
                 Object info = null;
+                SurfaceControl.Transaction tx = null;
                 for (Object a : p.args) {
                     if (a == null) continue;
                     if (fcb.isInstance(a)) hookFinish(a.getClass());
+                    else if (a instanceof SurfaceControl.Transaction) tx = (SurfaceControl.Transaction) a;
                     else if ("android.window.TransitionInfo".equals(a.getClass().getName())) info = a;
                 }
                 final SurfaceControl leash = info != null ? pickLeash(info) : null;
                 if (leash == null) return;
 
                 h().removeCallbacks(HIDE);
-                h().post(new Runnable() {
-                    @Override public void run() {
-                        Context ctx = app();
-                        if (ctx == null) return;
-                        DisplayMetrics dm = ctx.getResources().getDisplayMetrics();
-                        BarOverlay.attach(ctx, leash, dm.widthPixels, dm.heightPixels);
-                    }
-                });
+                // jalur utama: ikut transaksi awal animasi, jadi ada sejak frame pertama
+                boolean ok = tx != null && BarOverlay.attachTo(tx, leash);
+                if (!ok) {
+                    // cadangan: belum siap, buat sekarang (bisa telat)
+                    h().post(new Runnable() {
+                        @Override public void run() {
+                            Context ctx = app();
+                            if (ctx == null) return;
+                            DisplayMetrics dm = ctx.getResources().getDisplayMetrics();
+                            BarOverlay.attach(ctx, leash, dm.widthPixels, dm.heightPixels);
+                        }
+                    });
+                }
                 h().postDelayed(HIDE, 2500); // cadangan kalau callback finish tidak tertangkap
             }
         });
