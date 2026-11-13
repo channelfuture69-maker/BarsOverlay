@@ -20,7 +20,11 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  */
 public class MainHook implements IXposedHookLoadPackage {
 
-    private static final Handler H = new Handler(Looper.getMainLooper());
+    private static Handler sH;
+    private static Handler h() {
+        if (sH == null) sH = new Handler(Looper.getMainLooper());
+        return sH;
+    }
     private static final Set<Class<?>> DONE = Collections.synchronizedSet(new HashSet<Class<?>>());
     private static final Runnable HIDE = new Runnable() {
         @Override public void run() { BarOverlay.hide(); }
@@ -56,11 +60,11 @@ public class MainHook implements IXposedHookLoadPackage {
                 for (Object a : p.args) {
                     if (a != null && fcb.isInstance(a)) hookFinish(a.getClass());
                 }
-                H.post(new Runnable() {
+                h().post(new Runnable() {
                     @Override public void run() { BarOverlay.show(app()); }
                 });
-                H.removeCallbacks(HIDE);
-                H.postDelayed(HIDE, 2500); // cadangan kalau callback finish tidak tertangkap
+                h().removeCallbacks(HIDE);
+                h().postDelayed(HIDE, 2500); // cadangan kalau callback finish tidak tertangkap
             }
         });
     }
@@ -70,7 +74,7 @@ public class MainHook implements IXposedHookLoadPackage {
         XposedBridge.hookAllMethods(c, "onTransitionFinished", new XC_MethodHook() {
             @Override
             protected void beforeHookedMethod(MethodHookParam p) {
-                H.postDelayed(HIDE, 60);
+                h().postDelayed(HIDE, 60);
             }
         });
     }
