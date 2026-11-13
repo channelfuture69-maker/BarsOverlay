@@ -121,6 +121,23 @@ public final class BarOverlay {
         }
     }
 
+    /** Tempel langsung dengan transaksi sendiri (tanpa menunggu transaksi animasi). */
+    public static boolean attachNow(SurfaceControl leash) {
+        try {
+            SurfaceControl sc = warmSc;
+            if (sc == null || !sc.isValid() || leash == null || !leash.isValid()) return false;
+            new SurfaceControl.Transaction()
+                    .reparent(sc, leash)
+                    .setLayer(sc, Integer.MAX_VALUE)
+                    .setVisibility(sc, true)
+                    .apply();
+            return true;
+        } catch (Throwable t) {
+            XposedBridge.log(t);
+            return false;
+        }
+    }
+
     /** Cadangan kalau belum ada yang siap: buat sekarang lalu tempel (agak telat). */
     public static void attach(Context c, SurfaceControl leash, int w, int h) {
         prewarm(c, w, h);
