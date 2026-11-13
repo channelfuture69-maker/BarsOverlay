@@ -56,8 +56,37 @@ public final class BarOverlay {
         }
     }
 
-    /** View bar penuh layar: jam kiri atas, baterai kanan atas, pill bawah. */
-    public static View build(Context c, boolean darkContent) {
+    /**
+     * View bar penuh layar. Kalau foto status bar asli sudah ada, pakai itu (sama persis dengan sistem);
+     * kalau belum, jatuh ke gambar buatan sendiri. nativeLook=true: warna asli sistem apa adanya.
+     */
+    public static View build(Context c, boolean darkContent, boolean nativeLook) {
+        if (BarSnapshot.ready()) {
+            try {
+                FrameLayout f = BarSnapshot.view(c, darkContent, nativeLook);
+                if (!BarSnapshot.hasBottom()) {
+                    float d = c.getResources().getDisplayMetrics().density;
+                    View pill = new View(c);
+                    GradientDrawable g = new GradientDrawable();
+                    g.setColor(darkContent ? Color.BLACK : Color.WHITE);
+                    g.setStroke(1, darkContent ? 0x33FFFFFF : 0x33000000);
+                    g.setCornerRadius(dp(d, 5));
+                    pill.setBackground(g);
+                    FrameLayout.LayoutParams pp = new FrameLayout.LayoutParams(
+                            dp(d, 134), dp(d, 5), Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+                    pp.setMargins(0, 0, 0, dp(d, 8));
+                    f.addView(pill, pp);
+                }
+                return f;
+            } catch (Throwable t) {
+                XposedBridge.log(t);
+            }
+        }
+        return buildFake(c, darkContent);
+    }
+
+    /** Cadangan: jam kiri atas, baterai kanan atas, pill bawah (digambar sendiri). */
+    private static View buildFake(Context c, boolean darkContent) {
         float d = c.getResources().getDisplayMetrics().density;
         FrameLayout f = new FrameLayout(c);
 
@@ -94,7 +123,7 @@ public final class BarOverlay {
         DisplayManager dm = (DisplayManager) c.getSystemService(Context.DISPLAY_SERVICE);
         Display disp = dm.getDisplay(Display.DEFAULT_DISPLAY);
         s.host = new SurfaceControlViewHost(c, disp, new Binder());
-        s.host.setView(build(c, darkContent), w, h);
+        s.host.setView(build(c, darkContent, false), w, h);
         s.pkg = s.host.getSurfacePackage();
         s.sc = s.pkg.getSurfaceControl();
         return s;
