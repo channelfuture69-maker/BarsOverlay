@@ -20,29 +20,24 @@ public final class StatusBarFader {
         return sH;
     }
 
-    private static final Runnable IN = new Runnable() {
+    /** Pengaman: kalau lupa dimunculkan lagi, balikkan setelah 15 detik. */
+    private static final Runnable SAFETY = new Runnable() {
         @Override public void run() { fade(1f, 180); }
     };
 
     private StatusBarFader() {}
 
-    public static void fadeOut() {
-        h().post(new Runnable() {
-            @Override public void run() {
-                h().removeCallbacks(IN);
-                fade(0f, 120);
-                h().postDelayed(IN, 3000); // cadangan kalau sinyal selesai tidak tertangkap
-            }
-        });
+    /** Main thread. */
+    public static void hide() {
+        h().removeCallbacks(SAFETY);
+        fade(0f, 120);
+        h().postDelayed(SAFETY, 15000);
     }
 
-    public static void fadeIn() {
-        h().post(new Runnable() {
-            @Override public void run() {
-                h().removeCallbacks(IN);
-                fade(1f, 180);
-            }
-        });
+    /** Main thread. */
+    public static void show(long ms) {
+        h().removeCallbacks(SAFETY);
+        fade(1f, ms);
     }
 
     private static void fade(float alpha, long ms) {

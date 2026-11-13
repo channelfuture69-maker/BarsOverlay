@@ -1,15 +1,17 @@
 package com.nez.barsoverlay;
 
 import android.content.Context;
+import android.content.res.Configuration;
+import android.graphics.Color;
+import android.graphics.Rect;
 import android.os.Handler;
+import android.os.IBinder;
 import android.os.Looper;
 import android.util.DisplayMetrics;
 import android.view.SurfaceControl;
+import android.view.WindowManager;
 
-import java.util.Collections;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -18,13 +20,18 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * Launcher: bar (jam/baterai/pill) ditempel ke jendela aplikasi yang beranimasi.
- *   - jalur 1: RemoteTransition (buka/tutup lewat Shell transitions)
- *   - jalur 2: IRecentsAnimationRunner (tutup lewat gesture swipe-up/home)
- *   - jalur 3: IRemoteAnimationRunner (animasi remote versi lama)
- * System UI: status bar bawaan di-fade saat ada transisi aplikasi.
+ * Semua jalan di System UI (Shell transitions), jadi buka, tutup, dan swipe-up
+ * lewat satu pintu yang sama, apa pun launcher-nya.
+ *  - saat transisi aplikasi siap: bar ditempel ke leash jendela aplikasi (ikut animasi),
+ *    status bar bawaan di-fade keluar
+ *  - saat selesai (buka): bar tetap 2 detik lalu fade out sambil status bar bawaan fade in
+ *  - saat selesai (tutup): bar dilepas, status bar bawaan fade in
+ * Warna konten bar mengikuti status bar aplikasi: latar terang -> hitam, gelap -> putih.
  */
 public class MainHook implements IXposedHookLoadPackage {
+
+    private static final long LINGER_MS = 2000;
+    private static final long FADE_MS = 300;
 
     private static Handler sH;
 
@@ -33,263 +40,169 @@ public class MainHook implements IXposedHookLoadPackage {
         return sH;
     }
 
-    private static final Set<String> DONE = Collections.synchronizedSet(new HashSet<String>());
+    // transisi aplikasi yang sedang berjalan
+    private static volatile Object pendingKey;
+    private static volatile boolean pendingOpening;
 
-    /** Lepas bar yang tadi dipakai, lalu siapkan yang baru untuk animasi berikutnya. */
-    private static final Runnable HIDE = new Runnable() {
+    private static final Runnable RELEASE = new Runnable() {
         @Override public void run() {
             BarOverlay.release();
             warm();
         }
     };
 
+    private static final Runnable LINGER_END = new Runnable() {
+        @Override public void run() {
+            LingerOverlay.fadeOutAndRemove(FADE_MS);
+            StatusBarFader.show(FADE_MS);
+        }
+    };
+
+    private static final Runnable FALLBACK = new Runnable() {
+        @Override public void run() { endTransition(false); }
+    };
+
     private static final Runnable WARM = new Runnable() {
         @Override public void run() {
-            if (!BarOverlay.isWarm()) warm();
+            if (app() == null) {
+                h().postDelayed(this, 2000);
+            } else if (!BarOverlay.isWarm()) {
+                warm();
+            }
         }
     };
-
-    private static final XC_MethodHook FINISH_HOOK = new XC_MethodHook() {
-        @Override
-        protected void beforeHookedMethod(MethodHookParam p) {
-            h().removeCallbacks(HIDE);
-            h().postDelayed(HIDE, 60);
-        }
-    };
-
-    private static void warm() {
-        Context ctx = app();
-        if (ctx == null) return;
-        DisplayMetrics dm = ctx.getResources().getDisplayMetrics();
-        BarOverlay.prewarm(ctx, dm.widthPixels, dm.heightPixels);
-    }
-
-    private static void warmLater() {
-        h().removeCallbacks(WARM);
-        h().postDelayed(WARM, 500);
-    }
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpp) {
-        final ClassLoader cl = lpp.classLoader;
-        if ("com.android.systemui".equals(lpp.packageName)) {
-            hookSystemUi(cl);
-            return;
+        if (!"com.android.systemui".equals(lpp.packageName)) return; // semuanya di System UI
+        try {
+            Class<?> tr = XposedHelpers.findClass("com.android.wm.shell.transition.Transitions", lpp.classLoader);
+            XposedBridge.hookAllMethods(tr, "onTransitionReady", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam p) {
+                    try { onReady(p.args); } catch (Throwable t) { XposedBridge.log(t); }
+                }
+            });
+            XposedBridge.hookAllMethods(tr, "onFinish", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(final MethodHookParam p) {
+                    final Object key = p.args.length > 0 ? p.args[0] : null;
+                    h().post(new Runnable() {
+                        @Override public void run() { onFinished(key); }
+                    });
+                }
+            });
+            h().postDelayed(WARM, 4000);
+            XposedBridge.log("BarsOverlay: aktif di SystemUI");
+        } catch (Throwable t) {
+            XposedBridge.log(t);
         }
-        try { hookTransitions(cl); } catch (Throwable t) { XposedBridge.log(t); }
-        try { hookRecents(cl); } catch (Throwable t) { XposedBridge.log(t); }
-        try { hookLegacy(cl); } catch (Throwable t) { XposedBridge.log(t); }
-        XposedBridge.log("BarsOverlay: aktif di " + lpp.packageName);
     }
 
-    // ------------------------------------------------------------------ helper hook
+    // ------------------------------------------------------------------ transisi siap
 
-    /** Hook method bernama name pada kelas c dan induknya (sampai kelas framework). */
-    private static void hookChain(Class<?> c, String name, XC_MethodHook cb) {
-        for (Class<?> k = c; k != null; k = k.getSuperclass()) {
-            String n = k.getName();
-            if (n.startsWith("android.") || n.startsWith("java.") || n.startsWith("com.android.internal.")) break;
-            if (DONE.add(n + "#" + name)) XposedBridge.hookAllMethods(k, name, cb);
-        }
+    private static final class Pick {
+        SurfaceControl leash;
+        boolean dark;       // konten hitam?
+        boolean opening;
     }
 
-    /** Hook persis pada kelas c (untuk proxy framework seperti callback finish). */
-    private static void hookExact(Class<?> c, String name, XC_MethodHook cb) {
-        if (DONE.add(c.getName() + "#" + name)) XposedBridge.hookAllMethods(c, name, cb);
-    }
-
-    // ------------------------------------------------------------------ mulai bar
-
-    private static void startBars(final SurfaceControl leash, SurfaceControl.Transaction tx,
-                                  long fallbackMs, String path) {
-        if (leash == null) {
-            XposedBridge.log("BarsOverlay[" + path + "]: leash aplikasi tidak ketemu");
-            return;
+    private static void onReady(Object[] args) {
+        Object key = args.length > 0 ? args[0] : null;
+        Object info = null;
+        SurfaceControl.Transaction tx = null;
+        for (Object a : args) {
+            if (a == null) continue;
+            if ("android.window.TransitionInfo".equals(a.getClass().getName())) info = a;
+            else if (tx == null && a instanceof SurfaceControl.Transaction) tx = (SurfaceControl.Transaction) a;
         }
-        h().removeCallbacks(HIDE);
-        boolean warm = BarOverlay.isWarm();
-        boolean viaTx = tx != null && BarOverlay.attachTo(tx, leash);
-        boolean now = tx == null && BarOverlay.attachNow(leash);
-        XposedBridge.log("BarsOverlay[" + path + "]: warm=" + warm + " viaTx=" + viaTx + " now=" + now);
+        if (info == null) return;
+        final Context ctx = app();
+        final Pick pick = pick(info, ctx);
+        if (pick == null) return; // bukan transisi aplikasi layar penuh
 
-        // jaring pengaman: tempel ulang sedikit kemudian kalau transaksi awal tidak terpakai
-        h().postDelayed(new Runnable() {
+        boolean viaTx = tx != null && BarOverlay.attachTo(tx, pick.leash, pick.dark);
+        XposedBridge.log("BarsOverlay: transisi opening=" + pick.opening + " konten="
+                + (pick.dark ? "hitam" : "putih") + " warm=" + BarOverlay.isWarm() + " viaTx=" + viaTx);
+
+        pendingKey = key;
+        pendingOpening = pick.opening;
+
+        h().post(new Runnable() {
             @Override public void run() {
-                if (BarOverlay.isWarm()) {
-                    BarOverlay.attachNow(leash);
-                } else {
-                    Context ctx = app();
-                    if (ctx == null) return;
-                    DisplayMetrics dm = ctx.getResources().getDisplayMetrics();
-                    BarOverlay.attach(ctx, leash, dm.widthPixels, dm.heightPixels);
+                h().removeCallbacks(LINGER_END);
+                h().removeCallbacks(RELEASE);
+                LingerOverlay.remove();
+                StatusBarFader.hide();
+                if (ctx != null && pick.opening) LingerOverlay.prepare(ctx, pick.dark);
+                if (!BarOverlay.isWarm() && ctx != null) {
+                    // belum siap: buat sekarang lalu tempel (agak telat)
+                    int[] wh = screen(ctx);
+                    BarOverlay.prewarm(ctx, wh[0], wh[1]);
                 }
-            }
-        }, 40);
-        h().postDelayed(HIDE, fallbackMs);
-    }
-
-    // ------------------------------------------------------------------ jalur 1: RemoteTransition
-
-    private static void hookTransitions(ClassLoader cl) {
-        final Class<?> irt = XposedHelpers.findClass("android.window.IRemoteTransition", cl);
-        final Class<?> fcb = XposedHelpers.findClass("android.window.IRemoteTransitionFinishedCallback", cl);
-        Class<?> rt = XposedHelpers.findClass("android.window.RemoteTransition", cl);
-
-        final XC_MethodHook start = new XC_MethodHook() {
-            @Override
-            protected void beforeHookedMethod(MethodHookParam p) {
-                Object info = null;
-                SurfaceControl.Transaction tx = null;
-                for (Object a : p.args) {
-                    if (a == null) continue;
-                    if (fcb.isInstance(a)) hookExact(a.getClass(), "onTransitionFinished", FINISH_HOOK);
-                    else if (a instanceof SurfaceControl.Transaction) tx = (SurfaceControl.Transaction) a;
-                    else if ("android.window.TransitionInfo".equals(a.getClass().getName())) info = a;
-                }
-                if (info == null) return;
-                SurfaceControl leash = pickLeash(info);
-                if (leash == null && !hasAppTask(info)) return; // bukan transisi aplikasi
-                startBars(leash, tx, 2500, "transition");
-            }
-        };
-
-        XposedBridge.hookAllConstructors(rt, new XC_MethodHook() {
-            @Override
-            protected void afterHookedMethod(MethodHookParam p) {
-                for (Object a : p.args) {
-                    if (a != null && irt.isInstance(a)) hookChain(a.getClass(), "startAnimation", start);
-                }
-                warmLater();
+                // tempel ulang sebagai jaring pengaman kalau transaksi awal tidak terpakai
+                BarOverlay.attachNow(pick.leash, pick.dark);
+                h().removeCallbacks(FALLBACK);
+                h().postDelayed(FALLBACK, 15000);
             }
         });
     }
 
-    // ------------------------------------------------------------------ jalur 2: recents (gesture)
+    // ------------------------------------------------------------------ transisi selesai
 
-    private static void hookRecents(ClassLoader cl) {
-        Class<?> stub = XposedHelpers.findClassIfExists("android.view.IRecentsAnimationRunner$Stub", cl);
-        if (stub == null) return;
-
-        final XC_MethodHook start = new XC_MethodHook() {
-            @Override
-            protected void beforeHookedMethod(MethodHookParam p) {
-                SurfaceControl leash = null;
-                for (Object a : p.args) {
-                    if (a == null) continue;
-                    String n = a.getClass().getName();
-                    if (n.contains("IRecentsAnimationController")) {
-                        hookExact(a.getClass(), "finish", FINISH_HOOK);
-                    } else if (leash == null && isTargetArray(a)) {
-                        leash = pickTargetLeash((Object[]) a);
-                    }
-                }
-                startBars(leash, null, 10000, "recents");
-            }
-        };
-
-        XposedBridge.hookAllConstructors(stub, new XC_MethodHook() {
-            @Override
-            protected void afterHookedMethod(MethodHookParam p) {
-                hookChain(p.thisObject.getClass(), "onAnimationStart", start);
-                warmLater();
-            }
-        });
+    private static void onFinished(Object key) {
+        Object pk = pendingKey;
+        if (pk == null) return;
+        boolean match = key != null && (key == pk || key.equals(pk));
+        if (!match && key instanceof IBinder) return; // transisi lain
+        endTransition(pendingOpening);
     }
 
-    // ------------------------------------------------------------------ jalur 3: remote animation lama
-
-    private static void hookLegacy(ClassLoader cl) {
-        Class<?> stub = XposedHelpers.findClassIfExists("android.view.IRemoteAnimationRunner$Stub", cl);
-        if (stub == null) return;
-
-        final XC_MethodHook start = new XC_MethodHook() {
-            @Override
-            protected void beforeHookedMethod(MethodHookParam p) {
-                SurfaceControl leash = null;
-                boolean sawTargets = false;
-                for (Object a : p.args) {
-                    if (a == null) continue;
-                    if (a.getClass().getName().contains("FinishedCallback")) {
-                        hookExact(a.getClass(), "onAnimationFinished", FINISH_HOOK);
-                    } else if (!sawTargets && isTargetArray(a)) {
-                        sawTargets = true; // array pertama = apps
-                        leash = pickTargetLeash((Object[]) a);
-                    }
-                }
-                if (leash != null) startBars(leash, null, 2500, "legacy");
-            }
-        };
-
-        XposedBridge.hookAllConstructors(stub, new XC_MethodHook() {
-            @Override
-            protected void afterHookedMethod(MethodHookParam p) {
-                hookChain(p.thisObject.getClass(), "onAnimationStart", start);
-                warmLater();
-            }
-        });
-    }
-
-    // ------------------------------------------------------------------ cari leash
-
-    private static boolean isTargetArray(Object a) {
-        Class<?> k = a.getClass();
-        return k.isArray() && "android.view.RemoteAnimationTarget".equals(k.getComponentType().getName());
-    }
-
-    private static SurfaceControl pickTargetLeash(Object[] targets) {
-        try {
-            for (Object t : targets) {
-                if (t == null) continue;
-                Object wc = XposedHelpers.getObjectField(t, "windowConfiguration");
-                int type = (Integer) XposedHelpers.callMethod(wc, "getActivityType");
-                if (type == 2 || type == 3) continue; // HOME, RECENTS
-                Object leash = XposedHelpers.getObjectField(t, "leash");
-                if (leash instanceof SurfaceControl && ((SurfaceControl) leash).isValid()) {
-                    return (SurfaceControl) leash;
-                }
-            }
-        } catch (Throwable t) {
-            XposedBridge.log(t);
+    private static void endTransition(boolean opening) {
+        pendingKey = null;
+        h().removeCallbacks(FALLBACK);
+        h().removeCallbacks(RELEASE);
+        h().postDelayed(RELEASE, 60);
+        if (opening) {
+            LingerOverlay.showNow();
+            h().removeCallbacks(LINGER_END);
+            h().postDelayed(LINGER_END, LINGER_MS);
+        } else {
+            LingerOverlay.remove();
+            StatusBarFader.show(180);
         }
-        return null;
     }
 
-    /** Ada task aplikasi (bukan home/recents) di transisi ini? */
-    static boolean hasAppTask(Object info) {
+    // ------------------------------------------------------------------ baca TransitionInfo
+
+    private static Pick pick(Object info, Context ctx) {
         try {
             List<?> changes = (List<?>) XposedHelpers.callMethod(info, "getChanges");
-            for (Object ch : changes) {
-                Object ti = XposedHelpers.callMethod(ch, "getTaskInfo");
-                if (ti == null) continue;
-                int type = (Integer) XposedHelpers.callMethod(ti, "getActivityType");
-                if (type != 2 && type != 3) return true;
-            }
-        } catch (Throwable t) {
-            XposedBridge.log(t);
-        }
-        return false;
-    }
-
-    /** Ambil leash jendela aplikasi (bukan home/recents) dari TransitionInfo. */
-    private static SurfaceControl pickLeash(Object info) {
-        try {
-            List<?> changes = (List<?>) XposedHelpers.callMethod(info, "getChanges");
-            SurfaceControl best = null;
+            Pick best = null;
             int bestScore = -1;
+            boolean opening = false;
             for (Object ch : changes) {
                 Object ti = XposedHelpers.callMethod(ch, "getTaskInfo");
                 if (ti == null) continue;
                 int type = (Integer) XposedHelpers.callMethod(ti, "getActivityType");
-                if (type == 2 || type == 3) continue;
+                if (type == 2 || type == 3) continue; // HOME, RECENTS
+                Integer wm = callInt(ti, "getWindowingMode");
+                if (wm != null && wm != 1) continue;  // hanya layar penuh
                 Object leash = XposedHelpers.callMethod(ch, "getLeash");
                 if (!(leash instanceof SurfaceControl) || !((SurfaceControl) leash).isValid()) continue;
                 int mode = (Integer) XposedHelpers.callMethod(ch, "getMode");
-                int score = (mode == 1 || mode == 3) ? 2 : 1; // OPEN/TO_FRONT lebih diutamakan
+                boolean open = mode == 1 || mode == 3; // OPEN, TO_FRONT
+                opening |= open;
+                int score = open ? 2 : 1;
                 if (score > bestScore) {
-                    best = (SurfaceControl) leash;
+                    Pick pk = new Pick();
+                    pk.leash = (SurfaceControl) leash;
+                    pk.dark = darkContentFor(ti, ctx);
+                    best = pk;
                     bestScore = score;
                 }
             }
+            if (best != null) best.opening = opening;
             return best;
         } catch (Throwable t) {
             XposedBridge.log(t);
@@ -297,33 +210,61 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    // ------------------------------------------------------------------ System UI
-
-    private static void hookSystemUi(ClassLoader cl) {
+    private static Integer callInt(Object o, String m) {
         try {
-            Class<?> tr = XposedHelpers.findClass("com.android.wm.shell.transition.Transitions", cl);
-            XposedBridge.hookAllMethods(tr, "onTransitionReady", new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam p) {
-                    for (Object a : p.args) {
-                        if (a != null && "android.window.TransitionInfo".equals(a.getClass().getName())
-                                && hasAppTask(a)) {
-                            StatusBarFader.fadeOut();
-                            return;
-                        }
-                    }
-                }
-            });
-            XposedBridge.hookAllMethods(tr, "onFinish", new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam p) {
-                    StatusBarFader.fadeIn();
-                }
-            });
-            XposedBridge.log("BarsOverlay: fader status bar aktif di SystemUI");
+            return (Integer) XposedHelpers.callMethod(o, m);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static boolean isLight(int color) {
+        double lum = 0.299 * Color.red(color) + 0.587 * Color.green(color) + 0.114 * Color.blue(color);
+        return lum > 150;
+    }
+
+    /** true = konten bar hitam (latar terang), false = putih (latar gelap). */
+    private static boolean darkContentFor(Object ti, Context ctx) {
+        try {
+            Object td = XposedHelpers.getObjectField(ti, "taskDescription");
+            if (td != null) {
+                Integer sb = callInt(td, "getStatusBarColor");
+                if (sb != null && Color.alpha(sb) >= 200) return isLight(sb);
+                Integer ap = callInt(td, "getSystemBarsAppearance");
+                if (ap != null && (ap & 0x8) != 0) return true; // APPEARANCE_LIGHT_STATUS_BARS
+                Integer bg = callInt(td, "getBackgroundColor");
+                if (bg != null && Color.alpha(bg) >= 200) return isLight(bg);
+                Integer pr = callInt(td, "getPrimaryColor");
+                if (pr != null && Color.alpha(pr) >= 200) return isLight(pr);
+            }
         } catch (Throwable t) {
             XposedBridge.log(t);
         }
+        if (ctx != null) {
+            int night = ctx.getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK;
+            return night != Configuration.UI_MODE_NIGHT_YES;
+        }
+        return false;
+    }
+
+    // ------------------------------------------------------------------ util
+
+    private static int[] screen(Context ctx) {
+        try {
+            WindowManager wm = ctx.getSystemService(WindowManager.class);
+            Rect b = wm.getMaximumWindowMetrics().getBounds();
+            return new int[]{b.width(), b.height()};
+        } catch (Throwable t) {
+            DisplayMetrics dm = ctx.getResources().getDisplayMetrics();
+            return new int[]{dm.widthPixels, dm.heightPixels};
+        }
+    }
+
+    private static void warm() {
+        Context ctx = app();
+        if (ctx == null) return;
+        int[] wh = screen(ctx);
+        BarOverlay.prewarm(ctx, wh[0], wh[1]);
     }
 
     private static Context app() {
