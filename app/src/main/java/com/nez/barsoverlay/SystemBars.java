@@ -32,6 +32,23 @@ public final class SystemBars {
 
     private SystemBars() {}
 
+    /** Rotasi layar saat ini (0..3); 0 kalau tidak terbaca. */
+    public static int rotation(Context ctx) {
+        try {
+            android.hardware.display.DisplayManager dm = (android.hardware.display.DisplayManager)
+                    ctx.getSystemService(Context.DISPLAY_SERVICE);
+            return dm.getDisplay(android.view.Display.DEFAULT_DISPLAY).getRotation();
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
+    /** Buang snapshot lama (misalnya setelah layar diputar). */
+    public static void invalidate() {
+        status = null;
+        nav = null;
+    }
+
     /** Bit 1 = status bar ada, bit 2 = nav bar ada. */
     public static int state() {
         return (status != null ? 1 : 0) | (nav != null ? 2 : 0);

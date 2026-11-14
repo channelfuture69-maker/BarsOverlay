@@ -75,20 +75,63 @@ public class MainHook implements IXposedHookLoadPackage {
         @Override public void run() { endTransition(false, 0); }
     };
 
-    /** Ambil "screenshot" bar bawaan secara berkala selama tidak ada animasi. */
+    private static int lastRot = -1;
+    private static int tick;
+    /** true selama layar baru diputar dan bar asli belum selesai menata ulang: tidak ada bar salinan. */
+    private static volatile boolean settling;
+
+    /** Setelah layar diputar: ambil snapshot baru sesuai orientasi, lalu siapkan ulang bar. */
+    private static final Runnable RECAP = new Runnable() {
+        @Override public void run() {
+            Context ctx = app();
+            if (ctx != null) {
+                SystemBars.captureAll(ctx);
+                warm();
+            }
+            settling = false;
+        }
+    };
+
+    private static void onRotation(Context ctx) {
+        XposedBridge.log("BarsOverlay: layar diputar, snapshot dibuat ulang");
+        settling = true;
+        pendingKey = null;
+        pendingLeash = null;
+        h().removeCallbacks(FALLBACK);
+        h().removeCallbacks(LINGER_END);
+        h().removeCallbacks(RELEASE);
+        BarOverlay.release();
+        SystemBars.invalidate();
+        StatusBarFader.showAll(); // pastikan bar asli tidak tertinggal tersembunyi
+        h().removeCallbacks(RECAP);
+        h().postDelayed(RECAP, 700); // beri waktu bar asli menata ulang
+    }
+
+    /** Cek rotasi tiap 0,5 detik; ambil "screenshot" bar bawaan tiap 1,5 detik selama tidak ada animasi. */
     private static final Runnable SNAP = new Runnable() {
         @Override public void run() {
             try {
                 Context ctx = app();
-                if (ctx != null && pendingKey == null && !StatusBarFader.isHidden() && interactive(ctx)) {
-                    if (SystemBars.captureAll(ctx)) BarOverlay.refreshShots();
-                    // snapshot baru muncul pertama kali: bangun ulang supaya tidak pakai gambar cadangan
-                    if (BarOverlay.isWarm() && BarOverlay.builtState() != SystemBars.state()) warm();
+                if (ctx != null) {
+                    int rot = SystemBars.rotation(ctx);
+                    if (lastRot == -1) {
+                        lastRot = rot;
+                    } else if (rot != lastRot) {
+                        lastRot = rot;
+                        onRotation(ctx);
+                    }
+                    tick++;
+                    if (tick % 3 == 0 && !settling && pendingKey == null
+                            && !StatusBarFader.isHidden() && interactive(ctx)) {
+                        if (SystemBars.captureAll(ctx)) BarOverlay.refreshShots();
+                        // snapshot baru muncul pertama kali: bangun ulang supaya tidak pakai gambar cadangan
+                        if (BarOverlay.isWarm() && BarOverlay.builtState() != SystemBars.state()) warm();
+                    }
                 }
             } catch (Throwable t) {
                 XposedBridge.log(t);
             }
-            h().postDelayed(this, 1500);
+            h().postDelayed(this, 500);
         }
     };
 
@@ -150,7 +193,7 @@ public class MainHook implements IXposedHookLoadPackage {
             if ("android.window.TransitionInfo".equals(a.getClass().getName())) info = a;
             else if (tx == null && a instanceof SurfaceControl.Transaction) tx = (SurfaceControl.Transaction) a;
         }
-        if (info == null) return;
+        if (info == null || settling) return;
         final Context ctx = app();
         final Pick pick = pick(info, ctx);
         if (pick == null) return; // bukan transisi aplikasi layar penuh
@@ -253,12 +296,25 @@ public class MainHook implements IXposedHookLoadPackage {
         if (leash == null || !leash.isValid() || ctx == null) return r;
         int[] wh = screen(ctx);
         int w = wh[0], hgt = wh[1];
+        boolean portrait = w < hgt;
         SystemBars.Shot st = SystemBars.status, nv = SystemBars.nav;
+
+        // status bar: strip bar asli; bagian tengah dilewati hanya di portrait (lubang kamera)
         int sy = st != null ? st.y : 0;
         int sh = st != null ? st.bmp.getHeight() : 90;
-        Integer ls = AppPixels.avgLum(leash, new Rect(0, sy, w, Math.min(hgt, sy + sh)), true, exclude);
-        int nh = Math.min(nv != null ? nv.bmp.getHeight() : 48, 48);
-        Integer ln = AppPixels.avgLum(leash, new Rect(w / 4, hgt - nh, w * 3 / 4, hgt), false, exclude);
+        Rect sr = new Rect(0, Math.max(0, sy), w, Math.min(hgt, Math.max(0, sy) + sh));
+        Integer ls = AppPixels.avgLum(leash, sr, portrait, exclude);
+
+        // nav bar: area di belakang pill (tengah bawah) atau bar samping saat 3 tombol di landscape
+        Rect nr;
+        if (nv != null && nv.bmp.getWidth() < nv.bmp.getHeight()) {
+            nr = new Rect(nv.x, nv.y, nv.x + nv.bmp.getWidth(), nv.y + nv.bmp.getHeight());
+        } else {
+            int nh = Math.min(nv != null ? nv.bmp.getHeight() : 48, 48);
+            nr = new Rect(w / 4, hgt - nh, w * 3 / 4, hgt);
+        }
+        nr.intersect(0, 0, w, hgt);
+        Integer ln = AppPixels.avgLum(leash, nr, false, exclude);
         r[0] = ls == null ? null : ls >= LIGHT_BG;
         r[1] = ln == null ? null : ln >= LIGHT_BG;
         return r;
@@ -279,7 +335,11 @@ public class MainHook implements IXposedHookLoadPackage {
             Object bestTi = null;
             int bestScore = -1;
             boolean opening = false;
+            boolean openClose = false;
             for (Object ch : changes) {
+                // transisi yang memutar layar: biarkan sistem yang urus
+                Integer sr = callInt(ch, "getStartRotation"), er = callInt(ch, "getEndRotation");
+                if (sr != null && er != null && !sr.equals(er)) return null;
                 Object ti = XposedHelpers.callMethod(ch, "getTaskInfo");
                 if (ti == null) continue;
                 int type = (Integer) XposedHelpers.callMethod(ti, "getActivityType");
@@ -290,6 +350,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 if (!(leash instanceof SurfaceControl) || !((SurfaceControl) leash).isValid()) continue;
                 int mode = (Integer) XposedHelpers.callMethod(ch, "getMode");
                 boolean open = mode == 1 || mode == 3; // OPEN, TO_FRONT
+                if (mode >= 1 && mode <= 4) openClose = true; // buka/tutup (bukan resize/ubah ukuran)
                 opening |= open;
                 int score = open ? 2 : 1;
                 if (score > bestScore) {
@@ -300,7 +361,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     bestScore = score;
                 }
             }
-            if (best == null) return null;
+            if (best == null || !openClose) return null;
             best.opening = opening;
             best.pkg = pkgOf(bestTi);
 
