@@ -98,9 +98,9 @@ public final class SystemBars {
             old.batt = batt;
             return old; // tidak berubah
         }
-        int[] pct = percentiles(b);
+        int[] pct = percentiles(b, light);
         XposedBridge.log("BarsOverlay: snapshot " + (type == TYPE_STATUS_BAR ? "status" : "nav")
-                + " " + b.getWidth() + "x" + b.getHeight() + " alpha-p95=" + pct[0]
+                + " " + b.getWidth() + "x" + b.getHeight() + " alpha-ikon-p95=" + pct[0]
                 + " terang-p95=" + pct[1] + " ikon=" + (light ? "putih" : "gelap")
                 + " baterai=" + (batt != null));
         int[] loc = new int[2];
@@ -187,30 +187,37 @@ public final class SystemBars {
         return n == 0 || (sum / n) > 128;
     }
 
-    /** Persentil ke-95: [0] alpha (piksel alpha >= 64), [1] terang piksel abu-abu pekat (alpha >= 200). */
-    private static int[] percentiles(Bitmap b) {
+    /**
+     * Persentil ke-95 dari ikon (abu-abu/putih/hitam) saja, supaya warna menyala dan chip
+     * perekam layar yang selalu pekat tidak mengacaukan hitungan:
+     * [0] alpha ikon (ikon terang kalau srcLight, gelap kalau tidak; alpha >= 64),
+     * [1] terang ikon abu-abu pekat (alpha >= 200).
+     */
+    private static int[] percentiles(Bitmap b, boolean srcLight) {
         int w = b.getWidth(), h = b.getHeight();
         int[] px = new int[w * h];
         b.getPixels(px, 0, w, 0, 0, w, h);
-        return percentiles(px);
+        return percentiles(px, srcLight);
     }
 
-    private static int[] percentiles(int[] px) {
+    private static int[] percentiles(int[] px, boolean srcLight) {
         int[] ha = new int[256];
         int[] hb = new int[256];
         long na = 0, nb = 0;
         for (int p : px) {
             int a = p >>> 24;
-            if (a >= 64) {
+            if (a < 64) continue;
+            int r = (p >> 16) & 255, g = (p >> 8) & 255, bl = p & 255;
+            if (chromatic(r, g, bl)) continue;
+            int l = lum(r, g, bl);
+            boolean iconPixel = srcLight ? l >= 140 : l <= 110;
+            if (iconPixel) {
                 ha[a]++;
                 na++;
             }
             if (a >= 200) {
-                int r = (p >> 16) & 255, g = (p >> 8) & 255, bl = p & 255;
-                if (!chromatic(r, g, bl)) {
-                    hb[lum(r, g, bl)]++;
-                    nb++;
-                }
+                hb[l]++;
+                nb++;
             }
         }
         return new int[]{p95(ha, na, 255), p95(hb, nb, 255)};
@@ -240,7 +247,7 @@ public final class SystemBars {
         int[] px = new int[w * h];
         src.getPixels(px, 0, w, 0, 0, w, h);
 
-        int[] pc = percentiles(px);
+        int[] pc = percentiles(px, srcLight);
         float aScale = (pc[0] > 40 && pc[0] < 250) ? 255f / pc[0] : 1f;
         float gain = (srcLight && pc[1] > 100 && pc[1] < 250) ? Math.min(1.35f, 255f / pc[1]) : 1f;
         boolean invert = (!darkContent) != srcLight;
