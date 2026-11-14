@@ -2,6 +2,7 @@ package com.nez.barsoverlay;
 
 import android.content.Context;
 import android.graphics.PixelFormat;
+import android.view.Gravity;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
@@ -9,29 +10,36 @@ import android.widget.FrameLayout;
 import de.robv.android.xposed.XposedBridge;
 
 /**
- * Dipakai di System UI: bar yang tetap tampil setelah aplikasi terbuka, lalu fade out.
- * Dipasang transparan sejak animasi mulai, dinyalakan seketika saat animasi selesai.
- * Berisi dua versi (hitam dan putih) supaya warna bisa diganti seketika.
- * Semua method dipanggil dari main thread.
+ * Dipakai di System UI: bar yang tetap tampil setelah aplikasi terbuka sampai bar asli
+ * muncul kembali. Dipasang transparan sejak animasi mulai, dinyalakan seketika saat
+ * animasi selesai. Status bar dan nav bar masing-masing punya versi hitam dan putih,
+ * jadi warnanya bisa diganti seketika. Semua method dipanggil dari main thread.
  */
 public final class LingerOverlay {
 
     private static View view;
-    private static View darkRoot, lightRoot;
+    private static View statDark, statLight, navDark, navLight;
     private static WindowManager wm;
 
     private LingerOverlay() {}
 
-    public static void prepare(Context c, boolean darkContent) {
+    private static View add(FrameLayout box, BarOverlay.Part p) {
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(p.w, p.h, Gravity.TOP | Gravity.START);
+        lp.setMargins(p.x, p.y, 0, 0);
+        box.addView(p.view, lp);
+        return p.view;
+    }
+
+    public static void prepare(Context c, boolean darkStatus, boolean darkNav, int w, int h) {
         remove();
         try {
             wm = (WindowManager) c.getSystemService(Context.WINDOW_SERVICE);
             FrameLayout box = new FrameLayout(c);
-            darkRoot = BarOverlay.build(c, true).root;
-            lightRoot = BarOverlay.build(c, false).root;
-            box.addView(darkRoot);
-            box.addView(lightRoot);
-            setTone(darkContent);
+            statDark = add(box, BarOverlay.build(c, BarOverlay.STATUS, true, w, h));
+            statLight = add(box, BarOverlay.build(c, BarOverlay.STATUS, false, w, h));
+            navDark = add(box, BarOverlay.build(c, BarOverlay.NAV, true, w, h));
+            navLight = add(box, BarOverlay.build(c, BarOverlay.NAV, false, w, h));
+            setTones(darkStatus, darkNav);
             box.setAlpha(0f);
             WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
                     -1, -1,
@@ -51,10 +59,16 @@ public final class LingerOverlay {
         }
     }
 
-    /** Ganti warna seketika: true = konten hitam. */
-    public static void setTone(boolean darkContent) {
-        if (darkRoot != null) darkRoot.setVisibility(darkContent ? View.VISIBLE : View.INVISIBLE);
-        if (lightRoot != null) lightRoot.setVisibility(darkContent ? View.INVISIBLE : View.VISIBLE);
+    /** Ganti warna seketika; null = biarkan. true = konten hitam. */
+    public static void setTones(Boolean darkStatus, Boolean darkNav) {
+        if (darkStatus != null) {
+            if (statDark != null) statDark.setVisibility(darkStatus ? View.VISIBLE : View.INVISIBLE);
+            if (statLight != null) statLight.setVisibility(darkStatus ? View.INVISIBLE : View.VISIBLE);
+        }
+        if (darkNav != null) {
+            if (navDark != null) navDark.setVisibility(darkNav ? View.VISIBLE : View.INVISIBLE);
+            if (navLight != null) navLight.setVisibility(darkNav ? View.INVISIBLE : View.VISIBLE);
+        }
     }
 
     public static void showNow() {
@@ -64,22 +78,13 @@ public final class LingerOverlay {
         v.setAlpha(1f);
     }
 
-    public static void fadeOutAndRemove(long ms) {
-        final View v = view;
-        if (v == null) return;
-        v.animate().cancel();
-        v.animate().alpha(0f).setDuration(ms).withEndAction(new Runnable() {
-            @Override public void run() {
-                if (view == v) remove();
-            }
-        }).start();
-    }
-
     public static void remove() {
         View v = view;
         view = null;
-        darkRoot = null;
-        lightRoot = null;
+        statDark = null;
+        statLight = null;
+        navDark = null;
+        navLight = null;
         if (v == null) return;
         try {
             v.animate().cancel();

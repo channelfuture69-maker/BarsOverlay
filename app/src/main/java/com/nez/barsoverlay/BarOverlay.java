@@ -21,29 +21,33 @@ import android.widget.TextView;
 import de.robv.android.xposed.XposedBridge;
 
 /**
- * Jam + baterai + pill digambar di SurfaceControlViewHost lalu surface-nya di-reparent
- * ke leash jendela aplikasi yang beranimasi (ikut bergerak/mengecil/terpotong sudut).
- * Ada dua versi siap pakai: konten gelap (untuk latar terang) dan konten putih (latar gelap).
+ * Status bar dan nav bar ("screenshot" bar bawaan) ditempel ke leash jendela aplikasi
+ * yang beranimasi. Masing-masing bar punya warna sendiri (hitam atau putih), jadi ada
+ * empat versi siap pakai: status hitam/putih dan nav hitam/putih.
  */
 public final class BarOverlay {
 
-    /** Hasil build: view akar + dua gambar snapshot (kalau ada). */
-    public static final class Built {
-        public View root;
-        public ImageView top, bottom;
-        public int state; // bit snapshot yang dipakai saat dibuat
+    public static final int STATUS = 0;
+    public static final int NAV = 1;
+
+    /** Satu bar: view + posisi dan ukurannya di layar. */
+    public static final class Part {
+        public View view;
+        public ImageView iv;
+        public int x, y, w, h;
+        public boolean usesShot;
     }
 
     private static final class Slot {
+        int kind;
         boolean dark;
-        Built built;
+        Part part;
         SurfaceControlViewHost host;
         SurfaceControlViewHost.SurfacePackage pkg;
         volatile SurfaceControl sc;
     }
 
-    private static volatile Slot dark;   // konten hitam
-    private static volatile Slot light;  // konten putih
+    private static volatile Slot statDark, statLight, navDark, navLight;
 
     private BarOverlay() {}
 
@@ -66,56 +70,52 @@ public final class BarOverlay {
         }
     }
 
-    private static ImageView shotView(Context c, SystemBars.Shot shot, boolean darkContent, FrameLayout f) {
-        ImageView iv = new ImageView(c);
-        iv.setScaleType(ImageView.ScaleType.FIT_XY);
-        iv.setImageBitmap(SystemBars.tinted(shot.bmp, darkContent, shot.lightIcons));
-        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
-                shot.bmp.getWidth(), shot.bmp.getHeight(), Gravity.TOP | Gravity.START);
-        lp.setMargins(shot.x, shot.y, 0, 0);
-        f.addView(iv, lp);
-        return iv;
-    }
-
-    /**
-     * Bar penuh layar. Memakai snapshot status bar/nav bar bawaan (diwarnai hitam atau putih);
-     * kalau snapshot belum ada, pakai gambar sendiri (jam, baterai, pill).
-     */
-    public static Built build(Context c, boolean darkContent) {
+    /** Bangun satu bar. Pakai snapshot bar asli; kalau belum ada, gambar sendiri (cadangan). */
+    public static Part build(Context c, int kind, boolean dark, int screenW, int screenH) {
         float d = c.getResources().getDisplayMetrics().density;
+        SystemBars.Shot shot = kind == STATUS ? SystemBars.status : SystemBars.nav;
+        Part p = new Part();
+        if (shot != null) {
+            ImageView iv = new ImageView(c);
+            iv.setScaleType(ImageView.ScaleType.FIT_XY);
+            iv.setImageBitmap(SystemBars.tinted(shot.bmp, dark, shot.lightIcons, shot.batt));
+            p.view = iv;
+            p.iv = iv;
+            p.x = shot.x;
+            p.y = shot.y;
+            p.w = shot.bmp.getWidth();
+            p.h = shot.bmp.getHeight();
+            p.usesShot = true;
+            return p;
+        }
         FrameLayout f = new FrameLayout(c);
-        Built b = new Built();
-        b.root = f;
-        SystemBars.Shot st = SystemBars.status;
-        SystemBars.Shot nv = SystemBars.nav;
-        b.state = SystemBars.state();
-
-        if (st != null) {
-            b.top = shotView(c, st, darkContent, f);
-        } else {
+        p.view = f;
+        p.x = 0;
+        if (kind == STATUS) {
+            p.w = screenW;
+            p.h = dp(d, 40);
+            p.y = 0;
             TextClock clock = new TextClock(c);
             clock.setFormat24Hour("H:mm");
             clock.setFormat12Hour("h:mm");
-            style(clock, darkContent);
+            style(clock, dark);
             FrameLayout.LayoutParams cp = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.START);
             cp.setMargins(dp(d, 28), dp(d, 10), 0, 0);
             f.addView(clock, cp);
-
             TextView bat = new TextView(c);
             bat.setText(battery(c));
-            style(bat, darkContent);
+            style(bat, dark);
             FrameLayout.LayoutParams bp = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.END);
             bp.setMargins(0, dp(d, 10), dp(d, 28), 0);
             f.addView(bat, bp);
-        }
-
-        if (nv != null) {
-            b.bottom = shotView(c, nv, darkContent, f);
         } else {
+            p.w = screenW;
+            p.h = dp(d, 24);
+            p.y = screenH - p.h;
             View pill = new View(c);
             GradientDrawable g = new GradientDrawable();
-            g.setColor(darkContent ? Color.BLACK : Color.WHITE);
-            g.setStroke(1, darkContent ? 0x33FFFFFF : 0x33000000);
+            g.setColor(dark ? Color.BLACK : Color.WHITE);
+            g.setStroke(1, dark ? 0x33FFFFFF : 0x33000000);
             g.setCornerRadius(dp(d, 5));
             pill.setBackground(g);
             FrameLayout.LayoutParams pp = new FrameLayout.LayoutParams(
@@ -123,36 +123,18 @@ public final class BarOverlay {
             pp.setMargins(0, 0, 0, dp(d, 8));
             f.addView(pill, pp);
         }
-        return b;
+        return p;
     }
 
-    /** Bit snapshot yang dipakai versi siap-pakai saat ini (0 kalau belum ada). */
-    public static int builtState() {
-        Slot s = dark;
-        return (s != null && s.built != null) ? s.built.state : -1;
-    }
-
-    /** Ganti gambar snapshot di versi siap-pakai dengan yang terbaru. Main thread. */
-    public static void refreshShots() {
-        apply(dark);
-        apply(light);
-    }
-
-    private static void apply(Slot s) {
-        if (s == null || s.built == null) return;
-        SystemBars.Shot st = SystemBars.status, nv = SystemBars.nav;
-        if (s.built.top != null && st != null) s.built.top.setImageBitmap(SystemBars.tinted(st.bmp, s.dark, st.lightIcons));
-        if (s.built.bottom != null && nv != null) s.built.bottom.setImageBitmap(SystemBars.tinted(nv.bmp, s.dark, nv.lightIcons));
-    }
-
-    private static Slot make(Context c, boolean darkContent, int w, int h) {
+    private static Slot make(Context c, int kind, boolean dark, int w, int h) {
         Slot s = new Slot();
-        s.dark = darkContent;
+        s.kind = kind;
+        s.dark = dark;
         DisplayManager dm = (DisplayManager) c.getSystemService(Context.DISPLAY_SERVICE);
         Display disp = dm.getDisplay(Display.DEFAULT_DISPLAY);
+        s.part = build(c, kind, dark, w, h);
         s.host = new SurfaceControlViewHost(c, disp, new Binder());
-        s.built = build(c, darkContent);
-        s.host.setView(s.built.root, w, h);
+        s.host.setView(s.part.view, s.part.w, s.part.h);
         s.pkg = s.host.getSurfacePackage();
         s.sc = s.pkg.getSurfaceControl();
         return s;
@@ -165,33 +147,70 @@ public final class BarOverlay {
         try { if (s.host != null) s.host.release(); } catch (Throwable ignored) { }
     }
 
-    public static boolean isWarm() { return dark != null && light != null; }
+    public static boolean isWarm() {
+        return statDark != null && statLight != null && navDark != null && navLight != null;
+    }
 
-    /** Siapkan kedua versi lebih dulu supaya frame pertama animasi sudah ada bar-nya. Main thread. */
+    /** Bit snapshot yang dipakai versi siap-pakai saat ini (-1 kalau belum siap). */
+    public static int builtState() {
+        Slot a = statDark, b = navDark;
+        if (a == null || b == null) return -1;
+        return (a.part.usesShot ? 1 : 0) | (b.part.usesShot ? 2 : 0);
+    }
+
+    /** Siapkan keempat versi lebih dulu supaya frame pertama animasi sudah ada bar-nya. Main thread. */
     public static void prewarm(Context c, int w, int h) {
         release();
         try {
-            dark = make(c, true, w, h);
-            light = make(c, false, w, h);
+            statDark = make(c, STATUS, true, w, h);
+            statLight = make(c, STATUS, false, w, h);
+            navDark = make(c, NAV, true, w, h);
+            navLight = make(c, NAV, false, w, h);
         } catch (Throwable t) {
             XposedBridge.log(t);
             release();
         }
     }
 
-    private static SurfaceControl scFor(boolean darkContent) {
-        Slot s = darkContent ? dark : light;
+    /** Ganti gambar snapshot di versi siap-pakai dengan yang terbaru. Main thread. */
+    public static void refreshShots() {
+        apply(statDark);
+        apply(statLight);
+        apply(navDark);
+        apply(navLight);
+    }
+
+    private static void apply(Slot s) {
+        if (s == null || s.part == null || s.part.iv == null) return;
+        SystemBars.Shot sh = s.kind == STATUS ? SystemBars.status : SystemBars.nav;
+        if (sh != null) {
+            s.part.iv.setImageBitmap(SystemBars.tinted(sh.bmp, s.dark, sh.lightIcons, sh.batt));
+        }
+    }
+
+    private static SurfaceControl scOf(Slot s) {
         SurfaceControl sc = s != null ? s.sc : null;
         return (sc != null && sc.isValid()) ? sc : null;
     }
 
+    private static boolean put(SurfaceControl.Transaction tx, SurfaceControl leash, Slot s) {
+        SurfaceControl sc = scOf(s);
+        if (sc == null) return false;
+        tx.reparent(sc, leash)
+                .setPosition(sc, s.part.x, s.part.y)
+                .setLayer(sc, Integer.MAX_VALUE)
+                .setVisibility(sc, true);
+        return true;
+    }
+
     /** Tempel lewat transaksi awal animasi (tx): muncul bersama frame pertama. Thread mana pun. */
-    public static boolean attachTo(SurfaceControl.Transaction tx, SurfaceControl leash, boolean darkContent) {
+    public static boolean attachTo(SurfaceControl.Transaction tx, SurfaceControl leash,
+                                   boolean darkStatus, boolean darkNav) {
         try {
-            SurfaceControl sc = scFor(darkContent);
-            if (sc == null || leash == null || !leash.isValid()) return false;
-            tx.reparent(sc, leash).setLayer(sc, Integer.MAX_VALUE).setVisibility(sc, true);
-            return true;
+            if (leash == null || !leash.isValid()) return false;
+            boolean a = put(tx, leash, darkStatus ? statDark : statLight);
+            boolean b = put(tx, leash, darkNav ? navDark : navLight);
+            return a || b;
         } catch (Throwable t) {
             XposedBridge.log(t);
             return false;
@@ -199,15 +218,14 @@ public final class BarOverlay {
     }
 
     /** Tempel langsung dengan transaksi sendiri. */
-    public static boolean attachNow(SurfaceControl leash, boolean darkContent) {
+    public static boolean attachNow(SurfaceControl leash, boolean darkStatus, boolean darkNav) {
         try {
-            SurfaceControl sc = scFor(darkContent);
-            if (sc == null || leash == null || !leash.isValid()) return false;
-            new SurfaceControl.Transaction()
-                    .reparent(sc, leash)
-                    .setLayer(sc, Integer.MAX_VALUE)
-                    .setVisibility(sc, true)
-                    .apply();
+            if (leash == null || !leash.isValid()) return false;
+            SurfaceControl.Transaction tx = new SurfaceControl.Transaction();
+            boolean a = put(tx, leash, darkStatus ? statDark : statLight);
+            boolean b = put(tx, leash, darkNav ? navDark : navLight);
+            if (!a && !b) return false;
+            tx.apply();
             return true;
         } catch (Throwable t) {
             XposedBridge.log(t);
@@ -216,10 +234,11 @@ public final class BarOverlay {
     }
 
     public static void release() {
-        Slot a = dark, b = light;
-        dark = null;
-        light = null;
-        free(a);
-        free(b);
+        Slot[] all = {statDark, statLight, navDark, navLight};
+        statDark = null;
+        statLight = null;
+        navDark = null;
+        navLight = null;
+        for (Slot s : all) free(s);
     }
 }

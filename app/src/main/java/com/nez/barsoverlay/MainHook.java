@@ -25,11 +25,12 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 /**
  * Semua jalan di System UI (Shell transitions), jadi buka, tutup, dan swipe-up
  * lewat satu pintu yang sama, apa pun launcher-nya.
- *  - saat transisi aplikasi siap: bar ditempel ke leash jendela aplikasi (ikut animasi),
- *    status bar bawaan di-fade keluar
- *  - saat selesai (buka): bar tetap 2 detik lalu fade out sambil status bar bawaan fade in
- *  - saat selesai (tutup): bar dilepas, status bar bawaan fade in
- * Warna konten bar mengikuti status bar aplikasi: latar terang -> hitam, gelap -> putih.
+ *  - transisi aplikasi siap: status bar + nav bar ("screenshot" bar asli) ditempel ke leash
+ *    jendela aplikasi, bar asli di-fade keluar
+ *  - selesai (buka): overlay tetap 2 detik, lalu bar asli muncul DI ATAS overlay (tanpa
+ *    turun-naik opacity), baru overlay dilepas
+ *  - selesai (tutup): bar asli langsung kembali
+ * Warna status bar dan nav bar ditentukan terpisah (latar di belakang masing-masing).
  */
 public class MainHook implements IXposedHookLoadPackage {
 
@@ -48,8 +49,9 @@ public class MainHook implements IXposedHookLoadPackage {
     private static volatile boolean pendingOpening;
     private static volatile String lastOpenPkg;
 
-    /** Warna konten bar yang sudah dipelajari per aplikasi (true = hitam). */
-    private static final Map<String, Boolean> TONES = new ConcurrentHashMap<String, Boolean>();
+    /** Warna konten bar yang sudah dipelajari per aplikasi (true = hitam), terpisah status/nav. */
+    private static final Map<String, Boolean> TONES_S = new ConcurrentHashMap<String, Boolean>();
+    private static final Map<String, Boolean> TONES_N = new ConcurrentHashMap<String, Boolean>();
 
     private static final Runnable RELEASE = new Runnable() {
         @Override public void run() {
@@ -58,23 +60,31 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     };
 
+    /** Bar asli muncul di atas overlay yang masih penuh, lalu overlay dilepas. */
     private static final Runnable LINGER_END = new Runnable() {
         @Override public void run() {
-            LingerOverlay.fadeOutAndRemove(FADE_MS);
             StatusBarFader.show(FADE_MS);
+            h().postDelayed(new Runnable() {
+                @Override public void run() { LingerOverlay.remove(); }
+            }, FADE_MS + 80);
         }
     };
 
-    /** Setelah aplikasi terbuka: baca warna ikon yang dipilih sistem, simpan untuk animasi berikutnya. */
+    /** Setelah aplikasi terbuka: baca warna yang dipilih sistem, simpan untuk animasi berikutnya. */
     private static final Runnable LEARN = new Runnable() {
         @Override public void run() {
-            Boolean light = SystemBars.sampleLightIcons();
             String pkg = lastOpenPkg;
-            if (light == null || pkg == null) return;
-            boolean dark = !light;
-            TONES.put(pkg, dark);
-            LingerOverlay.setTone(dark);
-            XposedBridge.log("BarsOverlay: belajar " + pkg + " -> konten " + (dark ? "hitam" : "putih"));
+            if (pkg == null) return;
+            Boolean ls = SystemBars.sampleLight(SystemBars.TYPE_STATUS_BAR);
+            Boolean ln = SystemBars.sampleLight(SystemBars.TYPE_NAVIGATION_BAR);
+            Boolean ds = ls != null ? !ls : null;
+            Boolean dn = ln != null ? !ln : null;
+            if (ds != null) TONES_S.put(pkg, ds);
+            if (dn != null) TONES_N.put(pkg, dn);
+            LingerOverlay.setTones(ds, dn);
+            XposedBridge.log("BarsOverlay: belajar " + pkg + " -> status "
+                    + (ds == null ? "?" : ds ? "hitam" : "putih") + ", nav "
+                    + (dn == null ? "?" : dn ? "hitam" : "putih"));
         }
     };
 
@@ -82,7 +92,7 @@ public class MainHook implements IXposedHookLoadPackage {
         @Override public void run() { endTransition(false); }
     };
 
-    /** Ambil "screenshot" status bar/nav bar bawaan secara berkala selama tidak ada animasi. */
+    /** Ambil "screenshot" bar bawaan secara berkala selama tidak ada animasi. */
     private static final Runnable SNAP = new Runnable() {
         @Override public void run() {
             try {
@@ -141,7 +151,8 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static final class Pick {
         SurfaceControl leash;
-        boolean dark;       // konten hitam?
+        boolean darkStatus;  // konten status bar hitam?
+        boolean darkNav;     // konten nav bar hitam?
         boolean opening;
         String pkg;
     }
@@ -160,9 +171,10 @@ public class MainHook implements IXposedHookLoadPackage {
         final Pick pick = pick(info, ctx);
         if (pick == null) return; // bukan transisi aplikasi layar penuh
 
-        boolean viaTx = tx != null && BarOverlay.attachTo(tx, pick.leash, pick.dark);
-        XposedBridge.log("BarsOverlay: transisi opening=" + pick.opening + " konten="
-                + (pick.dark ? "hitam" : "putih") + " warm=" + BarOverlay.isWarm() + " viaTx=" + viaTx);
+        boolean viaTx = tx != null && BarOverlay.attachTo(tx, pick.leash, pick.darkStatus, pick.darkNav);
+        XposedBridge.log("BarsOverlay: transisi opening=" + pick.opening + " pkg=" + pick.pkg
+                + " status=" + (pick.darkStatus ? "hitam" : "putih") + " nav=" + (pick.darkNav ? "hitam" : "putih")
+                + " warm=" + BarOverlay.isWarm() + " viaTx=" + viaTx);
 
         pendingKey = key;
         pendingOpening = pick.opening;
@@ -172,18 +184,19 @@ public class MainHook implements IXposedHookLoadPackage {
             @Override public void run() {
                 h().removeCallbacks(LINGER_END);
                 h().removeCallbacks(RELEASE);
+                h().removeCallbacks(LEARN);
                 LingerOverlay.remove();
                 // ambil snapshot terbaru selagi bar asli masih tampil, baru di-fade
                 if (ctx != null && SystemBars.captureAll(ctx)) BarOverlay.refreshShots();
                 StatusBarFader.hide();
-                if (ctx != null && pick.opening) LingerOverlay.prepare(ctx, pick.dark);
+                int[] wh = ctx != null ? screen(ctx) : null;
+                if (ctx != null && pick.opening) LingerOverlay.prepare(ctx, pick.darkStatus, pick.darkNav, wh[0], wh[1]);
                 if (!BarOverlay.isWarm() && ctx != null) {
                     // belum siap: buat sekarang lalu tempel (agak telat)
-                    int[] wh = screen(ctx);
                     BarOverlay.prewarm(ctx, wh[0], wh[1]);
                 }
                 // tempel ulang sebagai jaring pengaman kalau transaksi awal tidak terpakai
-                BarOverlay.attachNow(pick.leash, pick.dark);
+                BarOverlay.attachNow(pick.leash, pick.darkStatus, pick.darkNav);
                 h().removeCallbacks(FALLBACK);
                 h().postDelayed(FALLBACK, 15000);
             }
@@ -207,13 +220,15 @@ public class MainHook implements IXposedHookLoadPackage {
         h().postDelayed(RELEASE, 60);
         if (opening) {
             LingerOverlay.showNow();
+            // nav bar asli menyesuaikan warnanya sedikit belakangan, jadi belajar dua kali
             h().removeCallbacks(LEARN);
             h().postDelayed(LEARN, 400);
+            h().postDelayed(LEARN, 1300);
             h().removeCallbacks(LINGER_END);
             h().postDelayed(LINGER_END, LINGER_MS);
         } else {
             LingerOverlay.remove();
-            StatusBarFader.show(180);
+            StatusBarFader.show(0); // overlay lepas seketika, bar asli ganti seketika (tanpa turun-naik)
         }
     }
 
@@ -250,7 +265,8 @@ public class MainHook implements IXposedHookLoadPackage {
             if (best == null) return null;
             best.opening = opening;
             best.pkg = pkgOf(bestTi);
-            best.dark = decideTone(bestTi, ctx, best.pkg, opening);
+            best.darkStatus = decideStatus(bestTi, ctx, best.pkg, opening);
+            best.darkNav = decideNav(bestTi, ctx, best.pkg, opening, best.darkStatus);
             return best;
         } catch (Throwable t) {
             XposedBridge.log(t);
@@ -268,10 +284,10 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** true = konten bar hitam. Urutan: hasil belajar -> warna bar asli (tutup) -> tebakan. */
-    private static boolean decideTone(Object ti, Context ctx, String pkg, boolean opening) {
+    /** true = status bar hitam. Urutan: hasil belajar -> bar asli (tutup) -> tebakan. */
+    private static boolean decideStatus(Object ti, Context ctx, String pkg, boolean opening) {
         if (pkg != null) {
-            Boolean learned = TONES.get(pkg);
+            Boolean learned = TONES_S.get(pkg);
             if (learned != null) return learned;
         }
         if (!opening) {
@@ -279,6 +295,19 @@ public class MainHook implements IXposedHookLoadPackage {
             if (st != null) return !st.lightIcons; // bar asli sedang menampilkan warna untuk aplikasi ini
         }
         return darkContentFor(ti, ctx);
+    }
+
+    /** true = nav bar hitam. Dipisah dari status bar: latar di bawah bisa beda dengan di atas. */
+    private static boolean decideNav(Object ti, Context ctx, String pkg, boolean opening, boolean statusDark) {
+        if (pkg != null) {
+            Boolean learned = TONES_N.get(pkg);
+            if (learned != null) return learned;
+        }
+        if (!opening) {
+            SystemBars.Shot nv = SystemBars.nav;
+            if (nv != null) return !nv.lightIcons;
+        }
+        return darkNavFor(ti, statusDark);
     }
 
     private static Integer callInt(Object o, String m) {
@@ -294,7 +323,7 @@ public class MainHook implements IXposedHookLoadPackage {
         return lum > 150;
     }
 
-    /** true = konten bar hitam (latar terang), false = putih (latar gelap). */
+    /** Tebakan status bar: true = konten hitam (latar terang), false = putih (latar gelap). */
     private static boolean darkContentFor(Object ti, Context ctx) {
         try {
             Object td = XposedHelpers.getObjectField(ti, "taskDescription");
@@ -316,6 +345,24 @@ public class MainHook implements IXposedHookLoadPackage {
             return night != Configuration.UI_MODE_NIGHT_YES;
         }
         return false;
+    }
+
+    /** Tebakan nav bar: warna nav bar aplikasi -> flag terang -> warna latar -> samakan dengan status bar. */
+    private static boolean darkNavFor(Object ti, boolean statusDark) {
+        try {
+            Object td = XposedHelpers.getObjectField(ti, "taskDescription");
+            if (td != null) {
+                Integer nb = callInt(td, "getNavigationBarColor");
+                if (nb != null && Color.alpha(nb) >= 200) return isLight(nb);
+                Integer ap = callInt(td, "getSystemBarsAppearance");
+                if (ap != null && (ap & 0x10) != 0) return true; // APPEARANCE_LIGHT_NAVIGATION_BARS
+                Integer bg = callInt(td, "getBackgroundColor");
+                if (bg != null && Color.alpha(bg) >= 200) return isLight(bg);
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(t);
+        }
+        return statusDark;
     }
 
     // ------------------------------------------------------------------ util
