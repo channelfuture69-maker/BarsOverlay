@@ -4,7 +4,6 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.graphics.Color;
-import android.graphics.ColorMatrixColorFilter;
 import android.graphics.drawable.GradientDrawable;
 import android.hardware.display.DisplayManager;
 import android.os.BatteryManager;
@@ -36,6 +35,7 @@ public final class BarOverlay {
     }
 
     private static final class Slot {
+        boolean dark;
         Built built;
         SurfaceControlViewHost host;
         SurfaceControlViewHost.SurfacePackage pkg;
@@ -66,20 +66,10 @@ public final class BarOverlay {
         }
     }
 
-    private static ColorMatrixColorFilter mono(boolean darkContent) {
-        float v = darkContent ? 0f : 255f;
-        return new ColorMatrixColorFilter(new float[]{
-                0, 0, 0, 0, v,
-                0, 0, 0, 0, v,
-                0, 0, 0, 0, v,
-                0, 0, 0, 1, 0});
-    }
-
     private static ImageView shotView(Context c, SystemBars.Shot shot, boolean darkContent, FrameLayout f) {
         ImageView iv = new ImageView(c);
         iv.setScaleType(ImageView.ScaleType.FIT_XY);
-        iv.setColorFilter(mono(darkContent));
-        iv.setImageBitmap(shot.bmp);
+        iv.setImageBitmap(SystemBars.tinted(shot.bmp, darkContent));
         FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
                 shot.bmp.getWidth(), shot.bmp.getHeight(), Gravity.TOP | Gravity.START);
         lp.setMargins(shot.x, shot.y, 0, 0);
@@ -151,12 +141,13 @@ public final class BarOverlay {
     private static void apply(Slot s) {
         if (s == null || s.built == null) return;
         SystemBars.Shot st = SystemBars.status, nv = SystemBars.nav;
-        if (s.built.top != null && st != null) s.built.top.setImageBitmap(st.bmp);
-        if (s.built.bottom != null && nv != null) s.built.bottom.setImageBitmap(nv.bmp);
+        if (s.built.top != null && st != null) s.built.top.setImageBitmap(SystemBars.tinted(st.bmp, s.dark));
+        if (s.built.bottom != null && nv != null) s.built.bottom.setImageBitmap(SystemBars.tinted(nv.bmp, s.dark));
     }
 
     private static Slot make(Context c, boolean darkContent, int w, int h) {
         Slot s = new Slot();
+        s.dark = darkContent;
         DisplayManager dm = (DisplayManager) c.getSystemService(Context.DISPLAY_SERVICE);
         Display disp = dm.getDisplay(Display.DEFAULT_DISPLAY);
         s.host = new SurfaceControlViewHost(c, disp, new Binder());

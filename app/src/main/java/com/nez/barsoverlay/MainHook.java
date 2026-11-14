@@ -1,5 +1,6 @@
 package com.nez.barsoverlay;
 
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.res.Configuration;
 import android.graphics.Color;
@@ -12,6 +13,8 @@ import android.view.SurfaceControl;
 import android.view.WindowManager;
 
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -43,6 +46,10 @@ public class MainHook implements IXposedHookLoadPackage {
     // transisi aplikasi yang sedang berjalan
     private static volatile Object pendingKey;
     private static volatile boolean pendingOpening;
+    private static volatile String lastOpenPkg;
+
+    /** Warna konten bar yang sudah dipelajari per aplikasi (true = hitam). */
+    private static final Map<String, Boolean> TONES = new ConcurrentHashMap<String, Boolean>();
 
     private static final Runnable RELEASE = new Runnable() {
         @Override public void run() {
@@ -58,6 +65,19 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     };
 
+    /** Setelah aplikasi terbuka: baca warna ikon yang dipilih sistem, simpan untuk animasi berikutnya. */
+    private static final Runnable LEARN = new Runnable() {
+        @Override public void run() {
+            Boolean light = SystemBars.sampleLightIcons();
+            String pkg = lastOpenPkg;
+            if (light == null || pkg == null) return;
+            boolean dark = !light;
+            TONES.put(pkg, dark);
+            LingerOverlay.setTone(dark);
+            XposedBridge.log("BarsOverlay: belajar " + pkg + " -> konten " + (dark ? "hitam" : "putih"));
+        }
+    };
+
     private static final Runnable FALLBACK = new Runnable() {
         @Override public void run() { endTransition(false); }
     };
@@ -68,7 +88,7 @@ public class MainHook implements IXposedHookLoadPackage {
             try {
                 Context ctx = app();
                 if (ctx != null && pendingKey == null && !StatusBarFader.isHidden() && interactive(ctx)) {
-                    if (SystemBars.captureAll()) BarOverlay.refreshShots();
+                    if (SystemBars.captureAll(ctx)) BarOverlay.refreshShots();
                     // snapshot baru muncul pertama kali: bangun ulang supaya tidak pakai gambar cadangan
                     if (BarOverlay.isWarm() && BarOverlay.builtState() != SystemBars.state()) warm();
                 }
@@ -123,6 +143,7 @@ public class MainHook implements IXposedHookLoadPackage {
         SurfaceControl leash;
         boolean dark;       // konten hitam?
         boolean opening;
+        String pkg;
     }
 
     private static void onReady(Object[] args) {
@@ -145,6 +166,7 @@ public class MainHook implements IXposedHookLoadPackage {
 
         pendingKey = key;
         pendingOpening = pick.opening;
+        if (pick.opening) lastOpenPkg = pick.pkg;
 
         h().post(new Runnable() {
             @Override public void run() {
@@ -152,7 +174,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 h().removeCallbacks(RELEASE);
                 LingerOverlay.remove();
                 // ambil snapshot terbaru selagi bar asli masih tampil, baru di-fade
-                if (SystemBars.captureAll()) BarOverlay.refreshShots();
+                if (ctx != null && SystemBars.captureAll(ctx)) BarOverlay.refreshShots();
                 StatusBarFader.hide();
                 if (ctx != null && pick.opening) LingerOverlay.prepare(ctx, pick.dark);
                 if (!BarOverlay.isWarm() && ctx != null) {
@@ -185,6 +207,8 @@ public class MainHook implements IXposedHookLoadPackage {
         h().postDelayed(RELEASE, 60);
         if (opening) {
             LingerOverlay.showNow();
+            h().removeCallbacks(LEARN);
+            h().postDelayed(LEARN, 400);
             h().removeCallbacks(LINGER_END);
             h().postDelayed(LINGER_END, LINGER_MS);
         } else {
@@ -199,6 +223,7 @@ public class MainHook implements IXposedHookLoadPackage {
         try {
             List<?> changes = (List<?>) XposedHelpers.callMethod(info, "getChanges");
             Pick best = null;
+            Object bestTi = null;
             int bestScore = -1;
             boolean opening = false;
             for (Object ch : changes) {
@@ -217,17 +242,43 @@ public class MainHook implements IXposedHookLoadPackage {
                 if (score > bestScore) {
                     Pick pk = new Pick();
                     pk.leash = (SurfaceControl) leash;
-                    pk.dark = darkContentFor(ti, ctx);
                     best = pk;
+                    bestTi = ti;
                     bestScore = score;
                 }
             }
-            if (best != null) best.opening = opening;
+            if (best == null) return null;
+            best.opening = opening;
+            best.pkg = pkgOf(bestTi);
+            best.dark = decideTone(bestTi, ctx, best.pkg, opening);
             return best;
         } catch (Throwable t) {
             XposedBridge.log(t);
             return null;
         }
+    }
+
+    private static String pkgOf(Object ti) {
+        try {
+            Object c = XposedHelpers.getObjectField(ti, "topActivity");
+            if (c == null) c = XposedHelpers.getObjectField(ti, "baseActivity");
+            return c instanceof ComponentName ? ((ComponentName) c).getPackageName() : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** true = konten bar hitam. Urutan: hasil belajar -> warna bar asli (tutup) -> tebakan. */
+    private static boolean decideTone(Object ti, Context ctx, String pkg, boolean opening) {
+        if (pkg != null) {
+            Boolean learned = TONES.get(pkg);
+            if (learned != null) return learned;
+        }
+        if (!opening) {
+            SystemBars.Shot st = SystemBars.status;
+            if (st != null) return !st.lightIcons; // bar asli sedang menampilkan warna untuk aplikasi ini
+        }
+        return darkContentFor(ti, ctx);
     }
 
     private static Integer callInt(Object o, String m) {
@@ -283,7 +334,7 @@ public class MainHook implements IXposedHookLoadPackage {
     private static void warm() {
         Context ctx = app();
         if (ctx == null) return;
-        if (!StatusBarFader.isHidden()) SystemBars.captureAll();
+        if (!StatusBarFader.isHidden()) SystemBars.captureAll(ctx);
         int[] wh = screen(ctx);
         BarOverlay.prewarm(ctx, wh[0], wh[1]);
         XposedBridge.log("BarsOverlay: siap, snapshot status=" + (SystemBars.status != null)
