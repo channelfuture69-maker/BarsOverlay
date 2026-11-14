@@ -48,6 +48,7 @@ public final class BarOverlay {
     }
 
     private static volatile Slot statDark, statLight, navDark, navLight;
+    private static volatile Slot curStat, curNav; // yang sedang menempel
 
     private BarOverlay() {}
 
@@ -78,7 +79,7 @@ public final class BarOverlay {
         if (shot != null) {
             ImageView iv = new ImageView(c);
             iv.setScaleType(ImageView.ScaleType.FIT_XY);
-            iv.setImageBitmap(SystemBars.tinted(shot.bmp, dark, shot.lightIcons, shot.batt));
+            iv.setImageBitmap(SystemBars.tinted(shot.bmp, dark, shot.batt));
             p.view = iv;
             p.iv = iv;
             p.x = shot.x;
@@ -184,7 +185,7 @@ public final class BarOverlay {
         if (s == null || s.part == null || s.part.iv == null) return;
         SystemBars.Shot sh = s.kind == STATUS ? SystemBars.status : SystemBars.nav;
         if (sh != null) {
-            s.part.iv.setImageBitmap(SystemBars.tinted(sh.bmp, s.dark, sh.lightIcons, sh.batt));
+            s.part.iv.setImageBitmap(SystemBars.tinted(sh.bmp, s.dark, sh.batt));
         }
     }
 
@@ -196,6 +197,7 @@ public final class BarOverlay {
     private static boolean put(SurfaceControl.Transaction tx, SurfaceControl leash, Slot s) {
         SurfaceControl sc = scOf(s);
         if (sc == null) return false;
+        if (s.kind == STATUS) curStat = s; else curNav = s;
         tx.reparent(sc, leash)
                 .setPosition(sc, s.part.x, s.part.y)
                 .setLayer(sc, Integer.MAX_VALUE)
@@ -233,7 +235,49 @@ public final class BarOverlay {
         }
     }
 
+    /** SurfaceControl bar yang sedang menempel (untuk dikecualikan saat membaca piksel aplikasi). */
+    public static SurfaceControl[] currentScs() {
+        SurfaceControl a = scOf(curStat), b = scOf(curNav);
+        if (a != null && b != null) return new SurfaceControl[]{a, b};
+        if (a != null) return new SurfaceControl[]{a};
+        if (b != null) return new SurfaceControl[]{b};
+        return new SurfaceControl[0];
+    }
+
+    /**
+     * Pindahkan bar dari leash jendela aplikasi ke jendela bar asli (yang sedang disembunyikan),
+     * seketika dan tanpa celah. Bar jadi anak jendela sistem, jadi pekat penuh seperti aslinya.
+     * Mengembalikan bitmask jenis yang berhasil dipindah (1 = status bar, 2 = nav bar).
+     * Boleh dipanggil dari thread mana pun.
+     */
+    public static int handoff(boolean darkStatus, boolean darkNav) {
+        int mask = 0;
+        try {
+            SurfaceControl.Transaction tx = new SurfaceControl.Transaction();
+            Slot s = darkStatus ? statDark : statLight;
+            SurfaceControl ws = SystemBars.windowSc(SystemBars.TYPE_STATUS_BAR);
+            SurfaceControl sc = scOf(s);
+            if (s != null && s.part.usesShot && ws != null && sc != null) {
+                tx.reparent(sc, ws).setPosition(sc, 0, 0).setLayer(sc, 1).setVisibility(sc, true);
+                mask |= 1;
+            }
+            Slot n = darkNav ? navDark : navLight;
+            SurfaceControl wn = SystemBars.windowSc(SystemBars.TYPE_NAVIGATION_BAR);
+            SurfaceControl scn = scOf(n);
+            if (n != null && n.part.usesShot && wn != null && scn != null) {
+                tx.reparent(scn, wn).setPosition(scn, 0, 0).setLayer(scn, 1).setVisibility(scn, true);
+                mask |= 2;
+            }
+            if (mask != 0) tx.apply();
+        } catch (Throwable t) {
+            XposedBridge.log(t);
+        }
+        return mask;
+    }
+
     public static void release() {
+        curStat = null;
+        curNav = null;
         Slot[] all = {statDark, statLight, navDark, navLight};
         statDark = null;
         statLight = null;

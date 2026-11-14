@@ -4,10 +4,12 @@ import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Rect;
+import android.view.SurfaceControl;
 import android.view.View;
 import android.view.ViewGroup;
 
 import de.robv.android.xposed.XposedBridge;
+import de.robv.android.xposed.XposedHelpers;
 
 /**
  * "Screenshot" status bar dan nav bar bawaan: view aslinya digambar ke bitmap transparan
@@ -65,6 +67,21 @@ public final class SystemBars {
             boolean light = lightIcons(b);
             b.recycle();
             return light;
+        } catch (Throwable t) {
+            XposedBridge.log(t);
+            return null;
+        }
+    }
+
+    /** SurfaceControl jendela bar asli (parent baru untuk bar salinan setelah animasi). */
+    public static SurfaceControl windowSc(int type) {
+        try {
+            View v = StatusBarFader.findWindow(type);
+            if (v == null) return null;
+            Object root = XposedHelpers.callMethod(v, "getViewRootImpl");
+            if (root == null) return null;
+            Object sc = XposedHelpers.callMethod(root, "getSurfaceControl");
+            return (sc instanceof SurfaceControl && ((SurfaceControl) sc).isValid()) ? (SurfaceControl) sc : null;
         } catch (Throwable t) {
             XposedBridge.log(t);
             return null;
@@ -170,21 +187,21 @@ public final class SystemBars {
         return Math.round(0.299f * r + 0.587f * g + 0.114f * b);
     }
 
-    /** Rata-rata terang piksel abu-abu/putih/hitam: > 128 berarti ikon putih. */
+    /** Rata-rata terang (dibobot alpha) piksel abu-abu/putih/hitam: > 128 berarti ikon putih. */
     private static boolean lightIcons(Bitmap b) {
         int w = b.getWidth(), h = b.getHeight();
         int[] px = new int[w * h];
         b.getPixels(px, 0, w, 0, 0, w, h);
-        double sum = 0;
-        long n = 0;
+        double sum = 0, wsum = 0;
         for (int p : px) {
-            if ((p >>> 24) <= 128) continue;
+            int a = p >>> 24;
+            if (a < 64) continue;
             int r = (p >> 16) & 255, g = (p >> 8) & 255, bl = p & 255;
             if (chromatic(r, g, bl)) continue;
-            sum += lum(r, g, bl);
-            n++;
+            sum += (double) lum(r, g, bl) * a;
+            wsum += a;
         }
-        return n == 0 || (sum / n) > 128;
+        return wsum == 0 || (sum / wsum) > 128;
     }
 
     /**
@@ -234,23 +251,17 @@ public final class SystemBars {
     }
 
     /**
-     * Sesuaikan snapshot dengan latar di belakang bar ini.
-     *  - Warna ikon asli sama dengan yang diinginkan dan tidak ada yang kurang pekat:
-     *    dikembalikan apa adanya (persis sistem).
-     *  - Beda (putih -> hitam atau sebaliknya): piksel abu-abu/putih/hitam dibalik terangnya.
-     *  - Warna menyala (kuning hemat daya, merah, hijau) tidak dibalik.
-     *  - Angka persen di dalam baterai berwarna (hemat daya) tetap gelap, seperti sistem.
-     *  - Gambar yang kurang pekat/terang dari aslinya dinormalkan supaya setara sistem.
+     * Sesuaikan snapshot dengan latar di belakang bar ini (tidak bergantung pada warna asli):
+     *  - ingin hitam: piksel abu-abu terang jadi hitam, yang gelap dibiarkan
+     *  - ingin putih: piksel abu-abu gelap jadi putih, yang terang dibiarkan
+     *  - warna menyala (kuning hemat daya, merah, hijau) tidak diubah
+     *  - angka persen di dalam baterai berwarna tetap gelap, seperti sistem
+     * Kalau tidak ada yang perlu diubah, gambar asli dikembalikan apa adanya (persis sistem).
      */
-    public static Bitmap tinted(Bitmap src, boolean darkContent, boolean srcLight, Rect batt) {
+    public static Bitmap tinted(Bitmap src, boolean darkContent, Rect batt) {
         int w = src.getWidth(), h = src.getHeight();
         int[] px = new int[w * h];
         src.getPixels(px, 0, w, 0, 0, w, h);
-
-        int[] pc = percentiles(px, srcLight);
-        float aScale = (pc[0] > 40 && pc[0] < 250) ? 255f / pc[0] : 1f;
-        float gain = (srcLight && pc[1] > 100 && pc[1] < 250) ? Math.min(1.35f, 255f / pc[1]) : 1f;
-        boolean invert = (!darkContent) != srcLight;
 
         // kotak ikon baterai sebenarnya + apakah isinya berwarna (hemat daya/mengisi)
         int bl = 0, bt = 0, br = 0, bb = 0;
@@ -270,39 +281,36 @@ public final class SystemBars {
             coloredFill = chrom >= 20 && br > bl && bb > bt;
         }
 
-        if (!invert && aScale == 1f && gain == 1f) return src;
-
         int band = 4;
+        boolean changed = false;
         for (int i = 0; i < px.length; i++) {
             int p = px[i];
             int a = p >>> 24;
             if (a == 0) continue;
             int r = (p >> 16) & 255, g = (p >> 8) & 255, b = p & 255;
-            boolean chrom = chromatic(r, g, b);
+            if (chromatic(r, g, b)) continue;
+            int l = lum(r, g, b);
 
             boolean digit = false;
-            if (coloredFill && !chrom) {
+            if (coloredFill) {
                 int x = i % w, y = i / w;
-                if (x >= bl + band && x <= br - band && y >= bt + band && y <= bb - band && lum(r, g, b) <= 140) {
-                    digit = true; // angka di dalam baterai: tetap gelap
-                }
+                digit = x >= bl + band && x <= br - band && y >= bt + band && y <= bb - band && l <= 140;
             }
+            if (digit) continue; // angka di dalam baterai berwarna: tetap gelap
 
-            if (!digit) {
-                if (gain != 1f) {
-                    r = Math.min(255, Math.round(r * gain));
-                    g = Math.min(255, Math.round(g * gain));
-                    b = Math.min(255, Math.round(b * gain));
+            if (darkContent) {
+                if (l >= 128) {
+                    px[i] = a << 24;
+                    changed = true;
                 }
-                if (invert && !chrom) {
-                    r = 255 - r;
-                    g = 255 - g;
-                    b = 255 - b;
+            } else {
+                if (l < 128) {
+                    px[i] = (a << 24) | 0xFFFFFF;
+                    changed = true;
                 }
             }
-            int na = aScale == 1f ? a : Math.min(255, Math.round(a * aScale));
-            px[i] = (na << 24) | (r << 16) | (g << 8) | b;
         }
+        if (!changed) return src;
         Bitmap out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
         out.setPixels(px, 0, w, 0, 0, w, h);
         return out;

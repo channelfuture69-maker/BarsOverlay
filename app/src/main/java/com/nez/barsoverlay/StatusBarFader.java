@@ -10,7 +10,10 @@ import java.util.List;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 
-/** Proses System UI: status bar dan nav bar bawaan di-fade keluar saat animasi app, lalu balik. */
+/**
+ * Proses System UI: status bar dan nav bar bawaan disembunyikan seketika saat animasi app
+ * (tanpa fade, supaya tidak dobel/tebal) dan dimunculkan seketika lagi.
+ */
 public final class StatusBarFader {
 
     private static Handler sH;
@@ -23,7 +26,7 @@ public final class StatusBarFader {
 
     /** Pengaman: kalau lupa dimunculkan lagi, balikkan setelah 15 detik. */
     private static final Runnable SAFETY = new Runnable() {
-        @Override public void run() { fade(1f, 180); hidden = false; }
+        @Override public void run() { set(SystemBars.TYPE_STATUS_BAR, 1f); set(SystemBars.TYPE_NAVIGATION_BAR, 1f); hidden = false; }
     };
 
     private StatusBarFader() {}
@@ -34,23 +37,31 @@ public final class StatusBarFader {
     public static void hide() {
         h().removeCallbacks(SAFETY);
         hidden = true;
-        fade(0f, 120);
+        set(SystemBars.TYPE_STATUS_BAR, 0f);
+        set(SystemBars.TYPE_NAVIGATION_BAR, 0f);
         h().postDelayed(SAFETY, 15000);
     }
 
-    /** Main thread. */
-    public static void show(long ms) {
+    /** Munculkan keduanya seketika. Main thread. */
+    public static void showAll() {
         h().removeCallbacks(SAFETY);
         hidden = false;
-        fade(1f, ms);
+        set(SystemBars.TYPE_STATUS_BAR, 1f);
+        set(SystemBars.TYPE_NAVIGATION_BAR, 1f);
     }
 
-    private static void fade(float alpha, long ms) {
+    /** Munculkan salah satu seketika. Main thread. */
+    public static void showType(int type) {
+        set(type, 1f);
+    }
+
+    private static void set(int type, float alpha) {
         try {
-            View s = findWindow(SystemBars.TYPE_STATUS_BAR);
-            if (s != null) s.animate().alpha(alpha).setDuration(ms).start();
-            View n = findWindow(SystemBars.TYPE_NAVIGATION_BAR);
-            if (n != null) n.animate().alpha(alpha).setDuration(ms).start();
+            View v = findWindow(type);
+            if (v != null) {
+                v.animate().cancel();
+                v.setAlpha(alpha);
+            }
         } catch (Throwable t) {
             XposedBridge.log(t);
         }
