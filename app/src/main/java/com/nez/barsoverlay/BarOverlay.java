@@ -69,7 +69,7 @@ public final class BarOverlay {
     private static ImageView shotView(Context c, SystemBars.Shot shot, boolean darkContent, FrameLayout f) {
         ImageView iv = new ImageView(c);
         iv.setScaleType(ImageView.ScaleType.FIT_XY);
-        iv.setImageBitmap(SystemBars.tinted(shot.bmp, darkContent));
+        iv.setImageBitmap(SystemBars.tinted(shot.bmp, darkContent, shot.lightIcons));
         FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
                 shot.bmp.getWidth(), shot.bmp.getHeight(), Gravity.TOP | Gravity.START);
         lp.setMargins(shot.x, shot.y, 0, 0);
@@ -141,8 +141,8 @@ public final class BarOverlay {
     private static void apply(Slot s) {
         if (s == null || s.built == null) return;
         SystemBars.Shot st = SystemBars.status, nv = SystemBars.nav;
-        if (s.built.top != null && st != null) s.built.top.setImageBitmap(SystemBars.tinted(st.bmp, s.dark));
-        if (s.built.bottom != null && nv != null) s.built.bottom.setImageBitmap(SystemBars.tinted(nv.bmp, s.dark));
+        if (s.built.top != null && st != null) s.built.top.setImageBitmap(SystemBars.tinted(st.bmp, s.dark, st.lightIcons));
+        if (s.built.bottom != null && nv != null) s.built.bottom.setImageBitmap(SystemBars.tinted(nv.bmp, s.dark, nv.lightIcons));
     }
 
     private static Slot make(Context c, boolean darkContent, int w, int h) {
