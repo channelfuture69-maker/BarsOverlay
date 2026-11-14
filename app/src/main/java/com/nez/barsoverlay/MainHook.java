@@ -1,9 +1,6 @@
 package com.nez.barsoverlay;
 
-import android.content.BroadcastReceiver;
 import android.content.Context;
-import android.content.Intent;
-import android.content.IntentFilter;
 import android.content.res.Configuration;
 import android.graphics.Color;
 import android.graphics.Rect;
@@ -11,7 +8,6 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.util.DisplayMetrics;
-import android.view.View;
 import android.view.SurfaceControl;
 import android.view.WindowManager;
 
@@ -36,8 +32,6 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static final long LINGER_MS = 2000;
     private static final long FADE_MS = 300;
-    /** Status bar asli fade in dulu di bawah bar tempelan yang masih penuh, baru bar tempelan fade out. */
-    private static final long REAL_IN_MS = 220;
 
     private static Handler sH;
 
@@ -49,9 +43,6 @@ public class MainHook implements IXposedHookLoadPackage {
     // transisi aplikasi yang sedang berjalan
     private static volatile Object pendingKey;
     private static volatile boolean pendingOpening;
-    // lagi masa serah-terima ke status bar asli (jangan ambil foto dulu)
-    private static volatile boolean lingering;
-    private static boolean rcvRegistered;
 
     private static final Runnable RELEASE = new Runnable() {
         @Override public void run() {
@@ -60,52 +51,41 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     };
 
-    // Serah-terima mulus: (1) bar asli fade in saat bar tempelan masih penuh,
-    // (2) setelah bar asli penuh, bar tempelan fade out. Tidak ada momen dua bar sama-sama setengah transparan.
     private static final Runnable LINGER_END = new Runnable() {
         @Override public void run() {
-            StatusBarFader.show(REAL_IN_MS);
-            h().removeCallbacks(OVERLAY_OUT);
-            h().postDelayed(OVERLAY_OUT, REAL_IN_MS);
-        }
-    };
-
-    private static final Runnable OVERLAY_OUT = new Runnable() {
-        @Override public void run() {
             LingerOverlay.fadeOutAndRemove(FADE_MS);
-            h().removeCallbacks(IDLE);
-            h().postDelayed(IDLE, FADE_MS + 400);
+            StatusBarFader.show(FADE_MS);
         }
-    };
-
-    private static final Runnable IDLE = new Runnable() {
-        @Override public void run() {
-            lingering = false;
-            scheduleRefresh();
-        }
-    };
-
-    private static final Runnable REFRESH = new Runnable() {
-        @Override public void run() { refreshNow(); }
     };
 
     private static final Runnable FALLBACK = new Runnable() {
         @Override public void run() { endTransition(false); }
     };
 
+    /** Ambil "screenshot" status bar/nav bar bawaan secara berkala selama tidak ada animasi. */
+    private static final Runnable SNAP = new Runnable() {
+        @Override public void run() {
+            try {
+                Context ctx = app();
+                if (ctx != null && pendingKey == null && !StatusBarFader.isHidden() && interactive(ctx)) {
+                    if (SystemBars.captureAll()) BarOverlay.refreshShots();
+                    // snapshot baru muncul pertama kali: bangun ulang supaya tidak pakai gambar cadangan
+                    if (BarOverlay.isWarm() && BarOverlay.builtState() != SystemBars.state()) warm();
+                }
+            } catch (Throwable t) {
+                XposedBridge.log(t);
+            }
+            h().postDelayed(this, 1500);
+        }
+    };
+
     private static final Runnable WARM = new Runnable() {
         @Override public void run() {
-            Context c = app();
-            if (c == null) {
+            if (app() == null) {
                 h().postDelayed(this, 2000);
-                return;
+            } else if (!BarOverlay.isWarm()) {
+                warm();
             }
-            if (!rcvRegistered) {
-                rcvRegistered = true;
-                registerReceivers(c);
-            }
-            if (!BarOverlay.isWarm()) warm();
-            scheduleRefresh();
         }
     };
 
@@ -130,6 +110,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
             });
             h().postDelayed(WARM, 4000);
+            h().postDelayed(SNAP, 5000);
             XposedBridge.log("BarsOverlay: aktif di SystemUI");
         } catch (Throwable t) {
             XposedBridge.log(t);
@@ -168,15 +149,12 @@ public class MainHook implements IXposedHookLoadPackage {
         h().post(new Runnable() {
             @Override public void run() {
                 h().removeCallbacks(LINGER_END);
-                h().removeCallbacks(OVERLAY_OUT);
-                h().removeCallbacks(IDLE);
-                h().removeCallbacks(REFRESH);
                 h().removeCallbacks(RELEASE);
-                lingering = false;
                 LingerOverlay.remove();
+                // ambil snapshot terbaru selagi bar asli masih tampil, baru di-fade
+                if (SystemBars.captureAll()) BarOverlay.refreshShots();
                 StatusBarFader.hide();
-                // buka: bar mengikuti warna app; tutup: warna asli sistem (kembali ke home)
-                if (ctx != null) LingerOverlay.prepare(ctx, pick.dark, !pick.opening);
+                if (ctx != null && pick.opening) LingerOverlay.prepare(ctx, pick.dark);
                 if (!BarOverlay.isWarm() && ctx != null) {
                     // belum siap: buat sekarang lalu tempel (agak telat)
                     int[] wh = screen(ctx);
@@ -204,15 +182,15 @@ public class MainHook implements IXposedHookLoadPackage {
         pendingKey = null;
         h().removeCallbacks(FALLBACK);
         h().removeCallbacks(RELEASE);
-        h().postDelayed(RELEASE, 100);
-        lingering = true;
-        // bar tempelan di leash dilepas 100 ms lagi; bar "linger" langsung menggantikannya tanpa celah
-        LingerOverlay.showNow();
-        h().removeCallbacks(LINGER_END);
-        h().removeCallbacks(OVERLAY_OUT);
-        h().removeCallbacks(IDLE);
-        // buka: tahan sebentar dulu; tutup: langsung serah-terima ke status bar asli
-        h().postDelayed(LINGER_END, opening ? LINGER_MS : 0);
+        h().postDelayed(RELEASE, 60);
+        if (opening) {
+            LingerOverlay.showNow();
+            h().removeCallbacks(LINGER_END);
+            h().postDelayed(LINGER_END, LINGER_MS);
+        } else {
+            LingerOverlay.remove();
+            StatusBarFader.show(180);
+        }
     }
 
     // ------------------------------------------------------------------ baca TransitionInfo
@@ -302,54 +280,22 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** Foto ulang status bar + pill asli (saat bar asli tampil penuh dan tidak ada transisi). */
-    private static void refreshNow() {
-        if (pendingKey != null || lingering) { // lagi sibuk, coba lagi nanti
-            h().removeCallbacks(REFRESH);
-            h().postDelayed(REFRESH, 1500);
-            return;
-        }
-        try {
-            View sb = StatusBarFader.findWindow(WindowManager.LayoutParams.TYPE_STATUS_BAR);
-            View nb = StatusBarFader.findWindow(WindowManager.LayoutParams.TYPE_NAVIGATION_BAR);
-            if (BarSnapshot.capture(sb, nb)) {
-                warm();
-            } else if (!BarSnapshot.ready()) { // bar belum siap / belum tampil penuh
-                h().removeCallbacks(REFRESH);
-                h().postDelayed(REFRESH, 3000);
-            }
-        } catch (Throwable t) {
-            XposedBridge.log(t);
-        }
-    }
-
-    private static void scheduleRefresh() {
-        h().removeCallbacks(REFRESH);
-        h().postDelayed(REFRESH, 600);
-    }
-
-    /** Foto diperbarui kalau jam, baterai, atau layar berubah. */
-    private static void registerReceivers(Context c) {
-        try {
-            IntentFilter f = new IntentFilter();
-            f.addAction(Intent.ACTION_TIME_TICK);
-            f.addAction(Intent.ACTION_TIMEZONE_CHANGED);
-            f.addAction(Intent.ACTION_BATTERY_CHANGED);
-            f.addAction(Intent.ACTION_SCREEN_ON);
-            f.addAction(Intent.ACTION_CONFIGURATION_CHANGED);
-            c.registerReceiver(new BroadcastReceiver() {
-                @Override public void onReceive(Context ctx, Intent i) { scheduleRefresh(); }
-            }, f);
-        } catch (Throwable t) {
-            XposedBridge.log(t);
-        }
-    }
-
     private static void warm() {
         Context ctx = app();
         if (ctx == null) return;
+        if (!StatusBarFader.isHidden()) SystemBars.captureAll();
         int[] wh = screen(ctx);
         BarOverlay.prewarm(ctx, wh[0], wh[1]);
+        XposedBridge.log("BarsOverlay: siap, snapshot status=" + (SystemBars.status != null)
+                + " nav=" + (SystemBars.nav != null));
+    }
+
+    private static boolean interactive(Context ctx) {
+        try {
+            return ctx.getSystemService(android.os.PowerManager.class).isInteractive();
+        } catch (Throwable t) {
+            return true;
+        }
     }
 
     private static Context app() {

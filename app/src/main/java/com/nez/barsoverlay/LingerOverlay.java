@@ -4,12 +4,11 @@ import android.content.Context;
 import android.graphics.PixelFormat;
 import android.view.View;
 import android.view.WindowManager;
-import android.view.animation.PathInterpolator;
 
 import de.robv.android.xposed.XposedBridge;
 
 /**
- * Dipakai di System UI: bar yang tetap tampil setelah animasi buka/tutup, lalu fade out mulus.
+ * Dipakai di System UI: bar yang tetap tampil setelah aplikasi terbuka, lalu fade out.
  * Dipasang transparan sejak animasi mulai, dinyalakan seketika saat animasi selesai.
  * Semua method dipanggil dari main thread.
  */
@@ -20,11 +19,11 @@ public final class LingerOverlay {
 
     private LingerOverlay() {}
 
-    public static void prepare(Context c, boolean darkContent, boolean nativeLook) {
+    public static void prepare(Context c, boolean darkContent) {
         remove();
         try {
             wm = (WindowManager) c.getSystemService(Context.WINDOW_SERVICE);
-            View v = BarOverlay.build(c, darkContent, nativeLook);
+            View v = BarOverlay.build(c, darkContent).root;
             v.setAlpha(0f);
             WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
                     -1, -1,
@@ -55,7 +54,7 @@ public final class LingerOverlay {
         final View v = view;
         if (v == null) return;
         v.animate().cancel();
-        v.animate().alpha(0f).setDuration(ms).setInterpolator(new PathInterpolator(0.4f, 0f, 0.2f, 1f)).withEndAction(new Runnable() {
+        v.animate().alpha(0f).setDuration(ms).withEndAction(new Runnable() {
             @Override public void run() {
                 if (view == v) remove();
             }
